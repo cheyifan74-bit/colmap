@@ -24,7 +24,9 @@ set(CLANG_TIDY_EXE "")
 if(LSD_ENABLED)
     add_subdirectory(LSD)
 endif()
-add_subdirectory(PoissonRecon)
+if(MVS_ENABLED)
+    add_subdirectory(PoissonRecon)
+endif()
 if(GPU_ENABLED)
     add_subdirectory(SiftGPU)
 endif()
@@ -48,6 +50,41 @@ if(FETCH_POSELIB)
     # benchmark/benchmark.h header (PoseLib exposes its entire source dir as include path)
     if(EXISTS "${poselib_SOURCE_DIR}/benchmark")
         file(RENAME "${poselib_SOURCE_DIR}/benchmark" "${poselib_SOURCE_DIR}/poselib_benchmark")
+    endif()
+    # PoseLib ships ~40 solvers; COLMAP only calls the ones wrapped in
+    # src/colmap/estimators/solvers (P3P, P4Pf, 5pt, 6pt focal, GP3P, gen 6pt).
+    # Drop unused solver .cc files and PoseLib's own RANSAC/bundle.
+    if(TARGET PoseLib)
+        set(_poselib_keep_solvers
+            p3p.cc
+            p4pf.cc
+            gp3p.cc
+            relpose_5pt.cc
+            relpose_6pt_focal.cc
+            relpose_6pt_onesided_focal.cc
+            gen_relpose_6pt.cc
+        )
+        get_target_property(_poselib_srcs PoseLib SOURCES)
+        set(_poselib_filtered "")
+        foreach(_src IN LISTS _poselib_srcs)
+            if(_src MATCHES "robust\\.cc$" OR _src MATCHES "robust/")
+                # COLMAP uses its own RANSAC, not PoseLib robust/.
+            elseif(_src MATCHES "solvers/[^/]+\\.cc$")
+                get_filename_component(_src_name "${_src}" NAME)
+                if(_src_name IN_LIST _poselib_keep_solvers)
+                    list(APPEND _poselib_filtered "${_src}")
+                endif()
+            else()
+                list(APPEND _poselib_filtered "${_src}")
+            endif()
+        endforeach()
+        set_property(TARGET PoseLib PROPERTY SOURCES ${_poselib_filtered})
+        list(LENGTH _poselib_srcs _poselib_n_all)
+        list(LENGTH _poselib_filtered _poselib_n_keep)
+        message(STATUS "PoseLib sources: ${_poselib_n_keep}/${_poselib_n_all} (COLMAP-used solvers only)")
+        unset(_poselib_srcs)
+        unset(_poselib_filtered)
+        unset(_poselib_keep_solvers)
     endif()
     message(STATUS "Configuring PoseLib... done")
 endif()

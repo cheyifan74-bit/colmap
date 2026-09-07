@@ -330,7 +330,9 @@ COLMAP_ADD_SOURCE_DIR(src/colmap/util UTIL_SRCS *.h *.cc)
 if(LSD_ENABLED)
     COLMAP_ADD_SOURCE_DIR(src/thirdparty/LSD THIRDPARTY_LSD_SRCS *.h *.c)
 endif()
-COLMAP_ADD_SOURCE_DIR(src/thirdparty/PoissonRecon THIRDPARTY_POISSON_RECON_SRCS *.h *.cpp *.inl)
+if(MVS_ENABLED)
+    COLMAP_ADD_SOURCE_DIR(src/thirdparty/PoissonRecon THIRDPARTY_POISSON_RECON_SRCS *.h *.cpp *.inl)
+endif()
 COLMAP_ADD_SOURCE_DIR(src/thirdparty/SiftGPU THIRDPARTY_SIFT_GPU_SRCS *.h *.cpp *.cu)
 COLMAP_ADD_SOURCE_DIR(src/thirdparty/VLFeat THIRDPARTY_VLFEAT_SRCS *.h *.c *.tc)
 
@@ -435,11 +437,13 @@ set(COLMAP_EXPORT_LIBS
     colmap_sfm
     colmap_util
     # Third-party.
-    colmap_poisson_recon
     colmap_vlfeat
 )
 if(MVS_ENABLED)
-    list(APPEND COLMAP_EXPORT_LIBS colmap_mvs)
+    list(APPEND COLMAP_EXPORT_LIBS
+         colmap_mvs
+         colmap_poisson_recon
+    )
 endif()
 if(LSD_ENABLED)
     list(APPEND COLMAP_EXPORT_LIBS
