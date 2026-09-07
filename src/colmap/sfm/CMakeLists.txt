@@ -36,6 +36,7 @@ COLMAP_ADD_LIBRARY(
         global_mapper.h global_mapper.cc
         incremental_mapper_impl.h incremental_mapper_impl.cc
         incremental_mapper.h incremental_mapper.cc
+        online_incremental_mapper.h online_incremental_mapper.cc
         incremental_triangulator.h incremental_triangulator.cc
         observation_manager.h observation_manager.cc
     PUBLIC_LINK_LIBS

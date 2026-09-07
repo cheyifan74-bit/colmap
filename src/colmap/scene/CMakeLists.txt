@@ -52,6 +52,7 @@ COLMAP_ADD_LIBRARY(
         correspondence_graph.h correspondence_graph.cc
         database.h database.cc
         database_sqlite.h database_sqlite.cc
+        database_session.h database_session.cc
         database_cache.h database_cache.cc
         point3d.h point3d.cc
         pose_graph.h pose_graph.cc
