@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "colmap/feature/extractor.h"
 #include "colmap/geometry/rigid3.h"
 #include "colmap/scene/database_cache.h"
 #include "colmap/util/eigen_alignment.h"
@@ -37,16 +38,29 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 
 namespace colmap {
 
 // Online wrapper around incremental SfM. Each Process() call currently:
 //   path-lock Open -> full DatabaseCache::Load (load_all_images) -> Close
-// SIFT / match / P3P / triangulate / local BA are added in later steps.
+//   SIFT -> path-lock Open -> WriteKeypoints / WriteDescriptors -> Close
+// Match / P3P / triangulate / local BA are added in later steps.
 // VIO pose is stored as a prior only; it is not written as a registered pose.
 class OnlineIncrementalMapper {
  public:
-  explicit OnlineIncrementalMapper(std::string database_path);
+  explicit OnlineIncrementalMapper(
+      std::string database_path,
+      FeatureExtractionOptions extraction_options =
+          FeatureExtractionOptions(FeatureExtractorType::SIFT))
+      : database_path_(std::move(database_path)),
+        extraction_options_(std::move(extraction_options)) {
+    extraction_options_.type = FeatureExtractorType::SIFT;
+  }
+  ~OnlineIncrementalMapper() = default;
+
+  OnlineIncrementalMapper(const OnlineIncrementalMapper&) = delete;
+  OnlineIncrementalMapper& operator=(const OnlineIncrementalMapper&) = delete;
 
   // `image_id` must already exist in the database (WriteImage happened first).
   // `cam_from_world_prior` is optional VIO left-camera pose in COLMAP convention.
@@ -65,8 +79,12 @@ class OnlineIncrementalMapper {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
  private:
+  bool ExtractAndWriteSift(image_t image_id, const std::string& image_abs_path);
+
   std::string database_path_;
+  FeatureExtractionOptions extraction_options_;
   std::shared_ptr<DatabaseCache> cache_;
+  std::unique_ptr<FeatureExtractor> sift_extractor_;
   image_t last_image_id_ = kInvalidImageId;
   std::string last_image_abs_path_;
   std::optional<Rigid3d> last_cam_from_world_prior_;
