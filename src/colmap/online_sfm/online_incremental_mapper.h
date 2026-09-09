@@ -50,6 +50,7 @@
 namespace colmap {
 
 class TimingStats;
+struct CpuMatchContext;
 
 // Linear sequential matching against the previous `overlap` keyframes.
 // Spatial pairing can be added later without changing the write path.
@@ -127,6 +128,7 @@ class OnlineIncrementalMapper {
   std::shared_ptr<DatabaseCache> cache_;
   std::unique_ptr<FeatureExtractor> feature_extractor_;
   std::unique_ptr<FeatureMatcher> feature_matcher_;
+  std::unique_ptr<CpuMatchContext> cpu_match_;
   std::unique_ptr<TimingStats> extract_timing_;
   std::unique_ptr<TimingStats> match_timing_;
   std::unordered_map<image_t, FeatureCacheEntry> feature_cache_;

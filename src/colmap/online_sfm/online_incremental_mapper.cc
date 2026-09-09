@@ -32,6 +32,7 @@
 #include "colmap/estimators/solvers/essential_matrix.h"
 #include "colmap/estimators/two_view_geometry.h"
 #include "colmap/feature/extractor.h"
+#include "colmap/feature/index.h"
 #include "colmap/feature/sift.h"
 #include "colmap/feature/utils.h"
 #include "colmap/online_sfm/timing_stats.h"
@@ -39,10 +40,14 @@
 #include "colmap/scene/database_session.h"
 #include "colmap/scene/two_view_geometry.h"
 #include "colmap/sensor/bitmap.h"
+#include "colmap/util/cache.h"
 #include "colmap/util/logging.h"
+#include "colmap/util/threading.h"
+#include "colmap/util/timer.h"
 
 #include <algorithm>
 #include <exception>
+#include <future>
 #include <iomanip>
 #include <sstream>
 
@@ -170,6 +175,11 @@ std::unique_ptr<TimingStats> CreateMatchTiming(
   stats->AddMeta("matcher",
                  std::string(FeatureMatcherTypeToString(options.matching.type)));
   stats->AddMeta("use_gpu", options.matching.use_gpu ? "1" : "0");
+  stats->AddMeta("cpu_brute_force",
+                 options.matching.sift &&
+                         options.matching.sift->cpu_brute_force_matcher
+                     ? "1"
+                     : "0");
   stats->AddMeta("gpu_index", options.matching.gpu_index);
   stats->AddMeta("overlap", std::to_string(options.overlap));
   stats->AddMeta("min_num_inliers",
@@ -187,7 +197,113 @@ std::unique_ptr<TimingStats> CreateMatchTiming(
   return stats;
 }
 
+struct PairMatchResult {
+  image_t prev_id = kInvalidImageId;
+  FeatureMatches matches;
+  TwoViewGeometry geometry;
+  double match_ms = 0.0;
+  double tvg_ms = 0.0;
+  std::string error;
+};
+
+PairMatchResult MatchAndVerifyPair(
+    FeatureMatcher* matcher,
+    const bool e_only,
+    const TwoViewGeometryOptions& geometry_options,
+    const FeatureMatcher::Image& prev,
+    const FeatureMatcher::Image& curr) {
+  PairMatchResult result;
+  result.prev_id = prev.image_id;
+  Timer timer;
+  try {
+    timer.Restart();
+    matcher->Match(prev, curr, &result.matches);
+    result.match_ms = timer.ElapsedMicroSeconds() / 1000.0;
+
+    if (result.matches.size() >=
+        static_cast<size_t>(geometry_options.min_num_inliers)) {
+      timer.Restart();
+      const auto points_prev =
+          FeatureKeypointsToPointsVector(*prev.keypoints);
+      const auto points_curr =
+          FeatureKeypointsToPointsVector(*curr.keypoints);
+      if (e_only) {
+        result.geometry = EstimateEssentialTwoViewGeometry(
+            *prev.camera, points_prev, *curr.camera, points_curr,
+            result.matches, geometry_options);
+      } else {
+        result.geometry = EstimateTwoViewGeometry(
+            *prev.camera, points_prev, *curr.camera, points_curr,
+            result.matches, geometry_options);
+      }
+      result.tvg_ms = timer.ElapsedMicroSeconds() / 1000.0;
+    }
+  } catch (const std::exception& e) {
+    result.error = e.what();
+  }
+  return result;
+}
+
+void WritePairResult(Database& database,
+                     TimingStats* match_timing,
+                     const image_t image_id,
+                     PairMatchResult result,
+                     const int min_num_inliers) {
+  if (!result.error.empty()) {
+    LOG(WARNING) << "OnlineIncrementalMapper: pair " << result.prev_id << "-"
+                 << image_id << " failed: " << result.error;
+    try {
+      if (!database.ExistsMatches(result.prev_id, image_id)) {
+        database.WriteMatches(result.prev_id, image_id, FeatureMatches());
+      }
+      if (!database.ExistsTwoViewGeometry(result.prev_id, image_id)) {
+        database.WriteTwoViewGeometry(
+            result.prev_id, image_id, TwoViewGeometry());
+      }
+    } catch (const std::exception& write_error) {
+      LOG(WARNING) << "OnlineIncrementalMapper: failed to write empty pair "
+                   << result.prev_id << "-" << image_id << ": "
+                   << write_error.what();
+    }
+    return;
+  }
+
+  match_timing->Record(
+      std::to_string(image_id), result.match_ms + result.tvg_ms,
+      {std::to_string(result.prev_id), FormatMs(result.match_ms),
+       FormatMs(result.tvg_ms), std::to_string(result.matches.size()),
+       std::to_string(result.geometry.inlier_matches.size()),
+       std::to_string(result.geometry.config)});
+
+  if (result.matches.size() < static_cast<size_t>(min_num_inliers)) {
+    result.matches.clear();
+  }
+  if (result.geometry.inlier_matches.size() <
+      static_cast<size_t>(min_num_inliers)) {
+    result.geometry = TwoViewGeometry();
+  }
+
+  database.WriteMatches(result.prev_id, image_id, result.matches);
+  database.WriteTwoViewGeometry(result.prev_id, image_id, result.geometry);
+
+  LOG(INFO) << "OnlineIncrementalMapper: match " << result.prev_id << "-"
+            << image_id << " matches=" << result.matches.size()
+            << " inliers=" << result.geometry.inlier_matches.size()
+            << " config=" << result.geometry.config;
+}
+
 }  // namespace
+
+struct CpuMatchContext {
+  CpuMatchContext(
+      size_t cache_size,
+      ThreadSafeLRUCache<image_t, FeatureDescriptorIndex>::LoadFn load_fn)
+      : index_cache(cache_size, std::move(load_fn)) {}
+
+  ThreadSafeLRUCache<image_t, FeatureDescriptorIndex> index_cache;
+  std::vector<std::unique_ptr<FeatureMatcher>> matchers;
+  std::unique_ptr<ThreadPool> thread_pool;
+};
 
 OnlineIncrementalMapper::OnlineIncrementalMapper(
     std::string database_path,
@@ -366,7 +482,7 @@ bool OnlineIncrementalMapper::ExtractAndWriteFeatures(
 }
 
 bool OnlineIncrementalMapper::InitFeatureMatcher() {
-  if (feature_matcher_) {
+  if (feature_matcher_ || cpu_match_) {
     return true;
   }
 
@@ -379,7 +495,6 @@ bool OnlineIncrementalMapper::InitFeatureMatcher() {
   }
 
   matching_options_.matching.guided_matching = false;
-  matching_options_.matching.num_threads = 1;
 
   // GPU SiftMatch allocates O(max_num_matches^2) device memory. COLMAP's
   // default 32768 would request a ~4GB score matrix and Create() returns null.
@@ -412,29 +527,85 @@ bool OnlineIncrementalMapper::InitFeatureMatcher() {
     return false;
   }
 
+  if (matching_options_.matching.use_gpu) {
+    matching_options_.matching.num_threads = 1;
+    try {
+      feature_matcher_ = FeatureMatcher::Create(matching_options_.matching);
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "OnlineIncrementalMapper: matcher Create threw: "
+                 << e.what();
+      feature_matcher_.reset();
+      return false;
+    }
+    if (!feature_matcher_) {
+      LOG(ERROR) << "OnlineIncrementalMapper: failed to create GPU matcher "
+                 << "type="
+                 << FeatureMatcherTypeToString(matching_options_.matching.type)
+                 << " gpu_index=" << matching_options_.matching.gpu_index
+                 << " max_num_matches="
+                 << matching_options_.matching.max_num_matches;
+      return false;
+    }
+    LOG(INFO) << "OnlineIncrementalMapper: matcher="
+              << FeatureMatcherTypeToString(matching_options_.matching.type)
+              << " use_gpu=1 gpu_index=" << matching_options_.matching.gpu_index
+              << " max_num_matches="
+              << matching_options_.matching.max_num_matches
+              << " overlap=" << matching_options_.overlap;
+    return true;
+  }
+
+  const int num_workers = std::max(
+      1,
+      std::min(GetEffectiveNumThreads(matching_options_.matching.num_threads),
+               std::max(matching_options_.overlap, 1)));
+  const size_t cache_size =
+      static_cast<size_t>(std::max(matching_options_.overlap, 0)) + 1;
+  cpu_match_ = std::make_unique<CpuMatchContext>(
+      cache_size, [this](const image_t image_id) {
+        auto index = FeatureDescriptorIndex::Create(
+            FeatureDescriptorIndex::Type::FAISS, /*num_threads=*/1);
+        const auto it = feature_cache_.find(image_id);
+        if (it != feature_cache_.end() && it->second.descriptors) {
+          index->Build(it->second.descriptors->ToFloat());
+        }
+        return index;
+      });
+
+  matching_options_.matching.sift->cpu_descriptor_index_cache =
+      matching_options_.matching.sift->cpu_brute_force_matcher
+          ? nullptr
+          : &cpu_match_->index_cache;
+
+  FeatureMatchingOptions worker_options = matching_options_.matching;
+  worker_options.num_threads = 1;
+  cpu_match_->matchers.reserve(static_cast<size_t>(num_workers));
   try {
-    feature_matcher_ = FeatureMatcher::Create(matching_options_.matching);
+    for (int i = 0; i < num_workers; ++i) {
+      auto matcher = FeatureMatcher::Create(worker_options);
+      if (!matcher) {
+        LOG(ERROR) << "OnlineIncrementalMapper: failed to create CPU matcher "
+                   << i << "/" << num_workers;
+        cpu_match_.reset();
+        matching_options_.matching.sift->cpu_descriptor_index_cache = nullptr;
+        return false;
+      }
+      cpu_match_->matchers.push_back(std::move(matcher));
+    }
   } catch (const std::exception& e) {
-    LOG(ERROR) << "OnlineIncrementalMapper: matcher Create threw: " << e.what();
-    feature_matcher_.reset();
+    LOG(ERROR) << "OnlineIncrementalMapper: CPU matcher Create threw: "
+               << e.what();
+    cpu_match_.reset();
+    matching_options_.matching.sift->cpu_descriptor_index_cache = nullptr;
     return false;
   }
-  if (!feature_matcher_) {
-    LOG(ERROR) << "OnlineIncrementalMapper: failed to create matcher type="
-               << FeatureMatcherTypeToString(matching_options_.matching.type)
-               << " use_gpu=" << matching_options_.matching.use_gpu
-               << " gpu_index=" << matching_options_.matching.gpu_index
-               << " max_num_matches="
-               << matching_options_.matching.max_num_matches;
-    return false;
-  }
+  cpu_match_->thread_pool = std::make_unique<ThreadPool>(num_workers);
 
   LOG(INFO) << "OnlineIncrementalMapper: matcher="
             << FeatureMatcherTypeToString(matching_options_.matching.type)
-            << " use_gpu=" << matching_options_.matching.use_gpu
-            << " gpu_index=" << matching_options_.matching.gpu_index
-            << " max_num_matches="
-            << matching_options_.matching.max_num_matches
+            << " use_gpu=0 cpu_workers=" << num_workers
+            << " brute_force="
+            << matching_options_.matching.sift->cpu_brute_force_matcher
             << " overlap=" << matching_options_.overlap;
   return true;
 }
@@ -458,6 +629,9 @@ void OnlineIncrementalMapper::CacheFeatures(
     const image_t old_id = feature_cache_order_.front();
     feature_cache_order_.pop_front();
     feature_cache_.erase(old_id);
+    if (cpu_match_) {
+      cpu_match_->index_cache.Evict(old_id);
+    }
   }
 }
 
@@ -511,7 +685,8 @@ bool OnlineIncrementalMapper::MatchAndWrite(const image_t image_id) {
     return true;
   }
 
-  const std::vector<image_t> previous_ids = SelectTemporalOverlapImages(image_id);
+  const std::vector<image_t> previous_ids =
+      SelectTemporalOverlapImages(image_id);
   if (previous_ids.empty()) {
     LOG(INFO) << "OnlineIncrementalMapper: skip match, image " << image_id
               << " has no previous keyframes";
@@ -522,9 +697,18 @@ bool OnlineIncrementalMapper::MatchAndWrite(const image_t image_id) {
     return false;
   }
 
+  struct PairWork {
+    image_t prev_id = kInvalidImageId;
+    FeatureCacheEntry previous;
+    const Camera* camera_prev = nullptr;
+  };
+
+  FeatureCacheEntry current;
+  const Camera* camera_cur = nullptr;
+  std::vector<PairWork> jobs;
   try {
     DatabaseSession session(database_path_);
-    const FeatureCacheEntry current = LoadFeatures(*session, image_id);
+    current = LoadFeatures(*session, image_id);
     if (!current.keypoints || !current.descriptors ||
         current.keypoints->empty() || current.descriptors->data.rows() == 0) {
       LOG(WARNING) << "OnlineIncrementalMapper: skip match, image " << image_id
@@ -539,124 +723,122 @@ bool OnlineIncrementalMapper::MatchAndWrite(const image_t image_id) {
                  << " missing camera for matching";
       return false;
     }
-    const Camera& camera1 = cache_->Camera(cache_->Image(image_id).CameraId());
+    camera_cur = &cache_->Camera(cache_->Image(image_id).CameraId());
 
+    jobs.reserve(previous_ids.size());
     for (const image_t prev_id : previous_ids) {
-      try {
-        if (!session->ExistsKeypoints(prev_id) ||
-            !session->ExistsDescriptors(prev_id)) {
-          LOG(WARNING) << "OnlineIncrementalMapper: skip pair " << prev_id
-                       << "-" << image_id << ", previous image has no features";
-          continue;
-        }
-
-        if (!cache_->ExistsImage(prev_id) ||
-            !cache_->Image(prev_id).HasCameraId() ||
-            !cache_->ExistsCamera(cache_->Image(prev_id).CameraId())) {
-          LOG(WARNING) << "OnlineIncrementalMapper: skip pair " << prev_id
-                       << "-" << image_id << ", previous image missing camera";
-          continue;
-        }
-
-        const bool exists_matches = session->ExistsMatches(prev_id, image_id);
-        const bool exists_tvg =
-            session->ExistsTwoViewGeometry(prev_id, image_id);
-        if (exists_matches && exists_tvg) {
-          LOG(INFO) << "OnlineIncrementalMapper: skip pair " << prev_id << "-"
-                    << image_id << ", already matched";
-          continue;
-        }
-        if (exists_matches) {
-          session->DeleteMatches(prev_id, image_id);
-        }
-        if (exists_tvg) {
-          session->DeleteTwoViewGeometry(prev_id, image_id);
-        }
-
-        const FeatureCacheEntry previous = LoadFeatures(*session, prev_id);
-        if (!previous.keypoints || !previous.descriptors ||
-            previous.keypoints->empty() ||
-            previous.descriptors->data.rows() == 0) {
-          LOG(WARNING) << "OnlineIncrementalMapper: skip pair " << prev_id
-                       << "-" << image_id << ", failed to load previous features";
-          continue;
-        }
-
-        const Camera& camera2 =
-            cache_->Camera(cache_->Image(prev_id).CameraId());
-
-        FeatureMatches matches;
-        match_timing_->Start();
-        feature_matcher_->Match(
-            {prev_id, &camera2, previous.keypoints, previous.descriptors},
-            {image_id, &camera1, current.keypoints, current.descriptors},
-            &matches);
-        const double match_ms = match_timing_->ElapsedMilliseconds();
-
-        TwoViewGeometry two_view_geometry;
-        double tvg_ms = 0.0;
-        if (matches.size() >=
-            static_cast<size_t>(matching_options_.geometry.min_num_inliers)) {
-          match_timing_->Start();
-          const auto points2 =
-              FeatureKeypointsToPointsVector(*previous.keypoints);
-          const auto points1 =
-              FeatureKeypointsToPointsVector(*current.keypoints);
-          if (matching_options_.e_only) {
-            two_view_geometry = EstimateEssentialTwoViewGeometry(
-                camera2, points2, camera1, points1, matches,
-                matching_options_.geometry);
-          } else {
-            two_view_geometry = EstimateTwoViewGeometry(
-                camera2, points2, camera1, points1, matches,
-                matching_options_.geometry);
-          }
-          tvg_ms = match_timing_->ElapsedMilliseconds();
-        }
-
-        match_timing_->Record(
-            std::to_string(image_id), match_ms + tvg_ms,
-            {std::to_string(prev_id), FormatMs(match_ms), FormatMs(tvg_ms),
-             std::to_string(matches.size()),
-             std::to_string(two_view_geometry.inlier_matches.size()),
-             std::to_string(two_view_geometry.config)});
-
-        if (matches.size() <
-            static_cast<size_t>(matching_options_.geometry.min_num_inliers)) {
-          matches.clear();
-        }
-        if (two_view_geometry.inlier_matches.size() <
-            static_cast<size_t>(matching_options_.geometry.min_num_inliers)) {
-          two_view_geometry = TwoViewGeometry();
-        }
-
-        session->WriteMatches(prev_id, image_id, matches);
-        session->WriteTwoViewGeometry(prev_id, image_id, two_view_geometry);
-
-        LOG(INFO) << "OnlineIncrementalMapper: match " << prev_id << "-"
-                  << image_id << " matches=" << matches.size()
-                  << " inliers=" << two_view_geometry.inlier_matches.size()
-                  << " config=" << two_view_geometry.config;
-      } catch (const std::exception& e) {
-        LOG(WARNING) << "OnlineIncrementalMapper: pair " << prev_id << "-"
-                     << image_id << " failed: " << e.what();
-        try {
-          if (!session->ExistsMatches(prev_id, image_id)) {
-            session->WriteMatches(prev_id, image_id, FeatureMatches());
-          }
-          if (!session->ExistsTwoViewGeometry(prev_id, image_id)) {
-            session->WriteTwoViewGeometry(
-                prev_id, image_id, TwoViewGeometry());
-          }
-        } catch (const std::exception& write_error) {
-          LOG(WARNING) << "OnlineIncrementalMapper: failed to write empty pair "
-                       << prev_id << "-" << image_id << ": "
-                       << write_error.what();
-        }
+      if (!session->ExistsKeypoints(prev_id) ||
+          !session->ExistsDescriptors(prev_id)) {
+        LOG(WARNING) << "OnlineIncrementalMapper: skip pair " << prev_id << "-"
+                     << image_id << ", previous image has no features";
+        continue;
       }
+      if (!cache_->ExistsImage(prev_id) ||
+          !cache_->Image(prev_id).HasCameraId() ||
+          !cache_->ExistsCamera(cache_->Image(prev_id).CameraId())) {
+        LOG(WARNING) << "OnlineIncrementalMapper: skip pair " << prev_id << "-"
+                     << image_id << ", previous image missing camera";
+        continue;
+      }
+
+      const bool exists_matches = session->ExistsMatches(prev_id, image_id);
+      const bool exists_tvg = session->ExistsTwoViewGeometry(prev_id, image_id);
+      if (exists_matches && exists_tvg) {
+        LOG(INFO) << "OnlineIncrementalMapper: skip pair " << prev_id << "-"
+                  << image_id << ", already matched";
+        continue;
+      }
+      if (exists_matches) {
+        session->DeleteMatches(prev_id, image_id);
+      }
+      if (exists_tvg) {
+        session->DeleteTwoViewGeometry(prev_id, image_id);
+      }
+
+      PairWork work;
+      work.prev_id = prev_id;
+      work.previous = LoadFeatures(*session, prev_id);
+      if (!work.previous.keypoints || !work.previous.descriptors ||
+          work.previous.keypoints->empty() ||
+          work.previous.descriptors->data.rows() == 0) {
+        LOG(WARNING) << "OnlineIncrementalMapper: skip pair " << prev_id << "-"
+                     << image_id << ", failed to load previous features";
+        continue;
+      }
+      work.camera_prev = &cache_->Camera(cache_->Image(prev_id).CameraId());
+      jobs.push_back(std::move(work));
     }
   } catch (const std::exception& e) {
     LOG(ERROR) << "OnlineIncrementalMapper: matching session failed: "
+               << e.what();
+    return false;
+  }
+
+  if (jobs.empty()) {
+    return true;
+  }
+
+  const FeatureMatcher::Image curr_image{
+      image_id, camera_cur, current.keypoints, current.descriptors};
+
+  std::vector<PairMatchResult> results;
+  results.reserve(jobs.size());
+  if (cpu_match_) {
+    if (!matching_options_.matching.sift->cpu_brute_force_matcher) {
+      cpu_match_->index_cache.Get(image_id);
+    }
+    std::vector<std::shared_future<PairMatchResult>> futures;
+    futures.reserve(jobs.size());
+    try {
+      for (const PairWork& job : jobs) {
+        const FeatureMatcher::Image prev_image{job.prev_id,
+                                               job.camera_prev,
+                                               job.previous.keypoints,
+                                               job.previous.descriptors};
+        futures.push_back(cpu_match_->thread_pool->AddTask(
+            [this, prev_image, curr_image]() {
+              const int idx = cpu_match_->thread_pool->GetThreadIndex();
+              return MatchAndVerifyPair(cpu_match_->matchers[idx].get(),
+                                        matching_options_.e_only,
+                                        matching_options_.geometry,
+                                        prev_image,
+                                        curr_image);
+            }));
+      }
+      cpu_match_->thread_pool->Wait();
+      for (auto& future : futures) {
+        results.push_back(future.get());
+      }
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "OnlineIncrementalMapper: CPU matching failed: "
+                 << e.what();
+      return false;
+    }
+  } else {
+    for (const PairWork& job : jobs) {
+      const FeatureMatcher::Image prev_image{job.prev_id,
+                                             job.camera_prev,
+                                             job.previous.keypoints,
+                                             job.previous.descriptors};
+      results.push_back(MatchAndVerifyPair(feature_matcher_.get(),
+                                           matching_options_.e_only,
+                                           matching_options_.geometry,
+                                           prev_image,
+                                           curr_image));
+    }
+  }
+
+  try {
+    DatabaseSession session(database_path_);
+    for (PairMatchResult& result : results) {
+      WritePairResult(*session,
+                      match_timing_.get(),
+                      image_id,
+                      std::move(result),
+                      matching_options_.geometry.min_num_inliers);
+    }
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "OnlineIncrementalMapper: failed to write matches: "
                << e.what();
     return false;
   }
