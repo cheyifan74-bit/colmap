@@ -66,8 +66,14 @@ double TimingStats::ElapsedMilliseconds() const {
 }
 
 void TimingStats::Record(const std::string& id, std::vector<std::string> extra) {
+  Record(id, ElapsedMilliseconds(), std::move(extra));
+}
+
+void TimingStats::Record(const std::string& id,
+                         const double elapsed_ms,
+                         std::vector<std::string> extra) {
   extra.resize(extra_columns_.size());
-  samples_.push_back({id, ElapsedMilliseconds(), std::move(extra)});
+  samples_.push_back({id, elapsed_ms, std::move(extra)});
 
   const Summary summary = ComputeSummary();
   std::ostringstream oss;

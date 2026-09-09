@@ -39,6 +39,7 @@ COLMAP_ADD_LIBRARY(
         colmap_sfm
         colmap_scene
         colmap_feature
+        colmap_estimators
         colmap_geometry
         colmap_util
     PRIVATE_LINK_LIBS

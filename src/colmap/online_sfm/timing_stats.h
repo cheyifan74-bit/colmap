@@ -61,6 +61,9 @@ class TimingStats {
   void Start();
   double ElapsedMilliseconds() const;
   void Record(const std::string& id, std::vector<std::string> extra = {});
+  void Record(const std::string& id,
+              double elapsed_ms,
+              std::vector<std::string> extra = {});
 
  private:
   struct Sample {

@@ -29,32 +29,61 @@
 
 #pragma once
 
+#include "colmap/estimators/two_view_geometry.h"
 #include "colmap/feature/extractor.h"
+#include "colmap/feature/matcher.h"
+#include "colmap/feature/types.h"
 #include "colmap/geometry/rigid3.h"
+#include "colmap/scene/database.h"
 #include "colmap/scene/database_cache.h"
 #include "colmap/util/eigen_alignment.h"
 #include "colmap/util/types.h"
 
+#include <deque>
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace colmap {
 
 class TimingStats;
 
+// Linear sequential matching against the previous `overlap` keyframes.
+// Spatial pairing can be added later without changing the write path.
+// Geometry defaults skip COLMAP's offline F/H/watermark path and use a
+// shorter RANSAC budget; `e_only` estimates the essential matrix only.
+struct OnlineMatchingOptions {
+  int overlap = 10;
+  bool e_only = true;
+  FeatureMatchingOptions matching =
+      FeatureMatchingOptions(FeatureMatcherType::SIFT_BRUTEFORCE);
+  TwoViewGeometryOptions geometry;
+
+  OnlineMatchingOptions() {
+    geometry.detect_watermark = false;
+    geometry.use_degensac = false;
+    geometry.ransac_options.min_num_trials = 30;
+    geometry.ransac_options.max_num_trials = 500;
+    geometry.ransac_options.confidence = 0.99;
+  }
+};
+
 // Online wrapper around incremental SfM. Each Process() call currently:
 //   path-lock Open -> full DatabaseCache::Load (load_all_images) -> Close
 //   extract -> path-lock Open -> WriteKeypoints / WriteDescriptors -> Close
-// Match / P3P / triangulate / local BA are added in later steps.
+//   match current vs previous overlap images -> WriteMatches / WriteTwoViewGeometry
+// P3P / triangulate / local BA are added in later steps.
 // VIO pose is stored as a prior only; it is not written as a registered pose.
 class OnlineIncrementalMapper {
  public:
   explicit OnlineIncrementalMapper(
       std::string database_path,
       FeatureExtractionOptions extraction_options =
-          FeatureExtractionOptions(FeatureExtractorType::SIFT));
+          FeatureExtractionOptions(FeatureExtractorType::SIFT),
+      OnlineMatchingOptions matching_options = {});
   ~OnlineIncrementalMapper();
 
   OnlineIncrementalMapper(const OnlineIncrementalMapper&) = delete;
@@ -77,14 +106,31 @@ class OnlineIncrementalMapper {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
  private:
+  struct FeatureCacheEntry {
+    std::shared_ptr<const FeatureKeypoints> keypoints;
+    std::shared_ptr<const FeatureDescriptors> descriptors;
+  };
+
   bool ExtractAndWriteFeatures(image_t image_id,
                                const std::string& image_abs_path);
+  bool MatchAndWrite(image_t image_id);
+  bool InitFeatureMatcher();
+  void CacheFeatures(image_t image_id,
+                     std::shared_ptr<const FeatureKeypoints> keypoints,
+                     std::shared_ptr<const FeatureDescriptors> descriptors);
+  FeatureCacheEntry LoadFeatures(Database& database, image_t image_id);
+  std::vector<image_t> SelectTemporalOverlapImages(image_t image_id) const;
 
   std::string database_path_;
   FeatureExtractionOptions extraction_options_;
+  OnlineMatchingOptions matching_options_;
   std::shared_ptr<DatabaseCache> cache_;
   std::unique_ptr<FeatureExtractor> feature_extractor_;
+  std::unique_ptr<FeatureMatcher> feature_matcher_;
   std::unique_ptr<TimingStats> extract_timing_;
+  std::unique_ptr<TimingStats> match_timing_;
+  std::unordered_map<image_t, FeatureCacheEntry> feature_cache_;
+  std::deque<image_t> feature_cache_order_;
   image_t last_image_id_ = kInvalidImageId;
   std::string last_image_abs_path_;
   std::optional<Rigid3d> last_cam_from_world_prior_;
