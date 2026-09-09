@@ -34,6 +34,7 @@ COLMAP_ADD_LIBRARY(
     NAME colmap_online_sfm
     SRCS
         online_incremental_mapper.h online_incremental_mapper.cc
+        timing_stats.h timing_stats.cc
     PUBLIC_LINK_LIBS
         colmap_sfm
         colmap_scene

@@ -31,6 +31,7 @@
 
 #include "colmap/feature/extractor.h"
 #include "colmap/feature/sift.h"
+#include "colmap/online_sfm/timing_stats.h"
 #include "colmap/scene/database_session.h"
 #include "colmap/sensor/bitmap.h"
 #include "colmap/util/logging.h"
@@ -55,6 +56,25 @@ void ScaleKeypointsToCamera(const Bitmap& bitmap,
 }
 
 }  // namespace
+
+OnlineIncrementalMapper::OnlineIncrementalMapper(
+    std::string database_path, FeatureExtractionOptions extraction_options)
+    : database_path_(std::move(database_path)),
+      extraction_options_(std::move(extraction_options)),
+      extract_timing_(std::make_unique<TimingStats>(
+          TimingStats::FileBesideDatabase(database_path_, "extract_timing.txt"),
+          "extract",
+          std::vector<std::string>{"num_features", "image"})) {
+  extract_timing_->AddMeta(
+      "extractor",
+      std::string(FeatureExtractorTypeToString(extraction_options_.type)));
+  extract_timing_->AddMeta("use_gpu",
+                           extraction_options_.use_gpu ? "1" : "0");
+  extract_timing_->AddMeta("gpu_index", extraction_options_.gpu_index);
+  extract_timing_->AddMeta("scope", "FeatureExtractor::Extract");
+}
+
+OnlineIncrementalMapper::~OnlineIncrementalMapper() = default;
 
 bool OnlineIncrementalMapper::Process(
     const image_t image_id,
@@ -96,20 +116,20 @@ bool OnlineIncrementalMapper::Process(
   LOG(INFO) << "OnlineIncrementalMapper: loaded cache with "
             << cache_->NumImages() << " image(s), current=" << image_id;
 
-  if (!ExtractAndWriteSift(image_id, image_abs_path)) {
+  if (!ExtractAndWriteFeatures(image_id, image_abs_path)) {
     return false;
   }
 
   return true;
 }
 
-bool OnlineIncrementalMapper::ExtractAndWriteSift(
+bool OnlineIncrementalMapper::ExtractAndWriteFeatures(
     const image_t image_id, const std::string& image_abs_path) {
   {
     DatabaseSession session(database_path_);
     if (session->ExistsKeypoints(image_id) &&
         session->ExistsDescriptors(image_id)) {
-      LOG(INFO) << "OnlineIncrementalMapper: skip SIFT, image " << image_id
+      LOG(INFO) << "OnlineIncrementalMapper: skip extract, image " << image_id
                 << " already has features";
       return true;
     }
@@ -122,61 +142,67 @@ bool OnlineIncrementalMapper::ExtractAndWriteSift(
   }
 
   Bitmap bitmap;
-  if (!bitmap.Read(image_abs_path, /*as_rgb=*/false)) {
+  if (!bitmap.Read(image_abs_path, extraction_options_.RequiresRGB())) {
     LOG(ERROR) << "OnlineIncrementalMapper: failed to read image "
                << image_abs_path;
     return false;
   }
 
-  if (!sift_extractor_) {
-    extraction_options_.type = FeatureExtractorType::SIFT;
+  if (!feature_extractor_) {
     if (extraction_options_.use_gpu) {
 #if !defined(COLMAP_GPU_ENABLED)
       LOG(ERROR)
           << "OnlineIncrementalMapper: use_gpu=true but COLMAP was built "
-             "without GPU. GPU SIFT requires CUDA (OpenGL SiftGPU is disabled "
-             "when GUI is off). Rebuild with CUDA_ENABLED=ON.";
+             "without GPU. Rebuild with CUDA_ENABLED=ON.";
       return false;
 #endif
-      if (extraction_options_.sift->estimate_affine_shape ||
-          extraction_options_.sift->domain_size_pooling ||
-          extraction_options_.sift->force_covariant_extractor) {
+      if (extraction_options_.type == FeatureExtractorType::SIFT &&
+          (extraction_options_.sift->estimate_affine_shape ||
+           extraction_options_.sift->domain_size_pooling ||
+           extraction_options_.sift->force_covariant_extractor)) {
         LOG(WARNING)
             << "OnlineIncrementalMapper: GPU SIFT is unavailable with "
                "affine/DSP/covariant SIFT; falling back to CPU covariant SIFT";
       }
     }
     if (!extraction_options_.Check()) {
-      LOG(ERROR) << "OnlineIncrementalMapper: invalid SIFT extraction options "
-                    "(use_gpu="
-                 << extraction_options_.use_gpu
-                 << ", gpu_index=" << extraction_options_.gpu_index << ")";
+      LOG(ERROR) << "OnlineIncrementalMapper: invalid extraction options "
+                    "type="
+                 << FeatureExtractorTypeToString(extraction_options_.type)
+                 << " use_gpu=" << extraction_options_.use_gpu
+                 << " gpu_index=" << extraction_options_.gpu_index;
       return false;
     }
-    sift_extractor_ = FeatureExtractor::Create(extraction_options_);
-    if (!sift_extractor_) {
-      LOG(ERROR) << "OnlineIncrementalMapper: failed to create SIFT extractor "
-                    "(use_gpu="
-                 << extraction_options_.use_gpu
-                 << ", gpu_index=" << extraction_options_.gpu_index << ")";
+    feature_extractor_ = FeatureExtractor::Create(extraction_options_);
+    if (!feature_extractor_) {
+      LOG(ERROR) << "OnlineIncrementalMapper: failed to create extractor "
+                    "type="
+                 << FeatureExtractorTypeToString(extraction_options_.type)
+                 << " use_gpu=" << extraction_options_.use_gpu
+                 << " gpu_index=" << extraction_options_.gpu_index;
       return false;
     }
-    LOG(INFO) << "OnlineIncrementalMapper: SIFT use_gpu="
-              << extraction_options_.use_gpu
+    LOG(INFO) << "OnlineIncrementalMapper: extractor="
+              << FeatureExtractorTypeToString(extraction_options_.type)
+              << " use_gpu=" << extraction_options_.use_gpu
               << " gpu_index=" << extraction_options_.gpu_index
-              << " max_num_features="
-              << extraction_options_.sift->max_num_features
-              << " peak_threshold=" << extraction_options_.sift->peak_threshold
               << " max_image_size=" << extraction_options_.max_image_size;
   }
 
   FeatureKeypoints keypoints;
   FeatureDescriptors descriptors;
-  if (!sift_extractor_->Extract(bitmap, &keypoints, &descriptors)) {
-    LOG(ERROR) << "OnlineIncrementalMapper: SIFT extraction failed for image "
-               << image_id;
+  extract_timing_->Start();
+  const bool extract_ok =
+      feature_extractor_->Extract(bitmap, &keypoints, &descriptors);
+  if (!extract_ok) {
+    LOG(ERROR) << "OnlineIncrementalMapper: extraction failed for image "
+               << image_id
+               << " extract_ms=" << extract_timing_->ElapsedMilliseconds();
     return false;
   }
+  extract_timing_->Record(
+      std::to_string(image_id),
+      {std::to_string(keypoints.size()), image_abs_path});
 
   if (cache_->ExistsImage(image_id)) {
     const Image& image = cache_->Image(image_id);
@@ -200,8 +226,9 @@ bool OnlineIncrementalMapper::ExtractAndWriteSift(
     return false;
   }
 
-  LOG(INFO) << "OnlineIncrementalMapper: SIFT image " << image_id << " -> "
-            << keypoints.size() << " features";
+  LOG(INFO) << "OnlineIncrementalMapper: extract image " << image_id << " -> "
+            << keypoints.size() << " features type="
+            << FeatureExtractorTypeToString(descriptors.type);
   return true;
 }
 
