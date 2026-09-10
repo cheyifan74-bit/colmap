@@ -33,6 +33,8 @@ set(FOLDER_NAME "online_sfm")
 COLMAP_ADD_LIBRARY(
     NAME colmap_online_sfm
     SRCS
+        online_feature_extractor.h online_feature_extractor.cc
+        online_feature_matcher.h online_feature_matcher.cc
         online_incremental_mapper.h online_incremental_mapper.cc
         timing_stats.h timing_stats.cc
     PUBLIC_LINK_LIBS

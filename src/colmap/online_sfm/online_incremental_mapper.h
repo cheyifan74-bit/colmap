@@ -18,7 +18,7 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
 // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS AND CONTRIBUTORS BE
 // LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
 // CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
 // SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
@@ -29,48 +29,18 @@
 
 #pragma once
 
-#include "colmap/estimators/two_view_geometry.h"
-#include "colmap/feature/extractor.h"
-#include "colmap/feature/matcher.h"
-#include "colmap/feature/types.h"
 #include "colmap/geometry/rigid3.h"
-#include "colmap/scene/database.h"
+#include "colmap/online_sfm/online_feature_extractor.h"
+#include "colmap/online_sfm/online_feature_matcher.h"
 #include "colmap/scene/database_cache.h"
 #include "colmap/util/eigen_alignment.h"
 #include "colmap/util/types.h"
 
-#include <deque>
 #include <memory>
 #include <optional>
 #include <string>
-#include <unordered_map>
-#include <utility>
-#include <vector>
 
 namespace colmap {
-
-class TimingStats;
-struct CpuMatchContext;
-
-// Linear sequential matching against the previous `overlap` keyframes.
-// Spatial pairing can be added later without changing the write path.
-// Geometry defaults skip COLMAP's offline F/H/watermark path and use a
-// shorter RANSAC budget; `e_only` estimates the essential matrix only.
-struct OnlineMatchingOptions {
-  int overlap = 10;
-  bool e_only = true;
-  FeatureMatchingOptions matching =
-      FeatureMatchingOptions(FeatureMatcherType::SIFT_BRUTEFORCE);
-  TwoViewGeometryOptions geometry;
-
-  OnlineMatchingOptions() {
-    geometry.detect_watermark = false;
-    geometry.use_degensac = false;
-    geometry.ransac_options.min_num_trials = 30;
-    geometry.ransac_options.max_num_trials = 500;
-    geometry.ransac_options.confidence = 0.99;
-  }
-};
 
 // Online wrapper around incremental SfM. Each Process() call currently:
 //   path-lock Open -> full DatabaseCache::Load (load_all_images) -> Close
@@ -107,32 +77,10 @@ class OnlineIncrementalMapper {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
  private:
-  struct FeatureCacheEntry {
-    std::shared_ptr<const FeatureKeypoints> keypoints;
-    std::shared_ptr<const FeatureDescriptors> descriptors;
-  };
-
-  bool ExtractAndWriteFeatures(image_t image_id,
-                               const std::string& image_abs_path);
-  bool MatchAndWrite(image_t image_id);
-  bool InitFeatureMatcher();
-  void CacheFeatures(image_t image_id,
-                     std::shared_ptr<const FeatureKeypoints> keypoints,
-                     std::shared_ptr<const FeatureDescriptors> descriptors);
-  FeatureCacheEntry LoadFeatures(Database& database, image_t image_id);
-  std::vector<image_t> SelectTemporalOverlapImages(image_t image_id) const;
-
   std::string database_path_;
-  FeatureExtractionOptions extraction_options_;
-  OnlineMatchingOptions matching_options_;
   std::shared_ptr<DatabaseCache> cache_;
-  std::unique_ptr<FeatureExtractor> feature_extractor_;
-  std::unique_ptr<FeatureMatcher> feature_matcher_;
-  std::unique_ptr<CpuMatchContext> cpu_match_;
-  std::unique_ptr<TimingStats> extract_timing_;
-  std::unique_ptr<TimingStats> match_timing_;
-  std::unordered_map<image_t, FeatureCacheEntry> feature_cache_;
-  std::deque<image_t> feature_cache_order_;
+  std::unique_ptr<OnlineFeatureExtractor> extractor_;
+  std::unique_ptr<OnlineFeatureMatcher> matcher_;
   image_t last_image_id_ = kInvalidImageId;
   std::string last_image_abs_path_;
   std::optional<Rigid3d> last_cam_from_world_prior_;
