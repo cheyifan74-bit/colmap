@@ -32,26 +32,35 @@
 #include "colmap/estimators/two_view_geometry.h"
 #include "colmap/feature/matcher.h"
 #include "colmap/feature/types.h"
+#include "colmap/geometry/rigid3.h"
 #include "colmap/scene/database.h"
 #include "colmap/scene/database_cache.h"
+#include "colmap/util/eigen_alignment.h"
 #include "colmap/util/types.h"
 
 #include <deque>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace colmap {
 
 class TimingStats;
 
-// Linear sequential matching against the previous `overlap` keyframes.
-// Spatial pairing can be added later without changing the write path.
+// Temporal overlap plus spatial pairing (VIO camera center / viewing angle).
 // Geometry defaults skip COLMAP's offline F/H/watermark path and use a
 // shorter RANSAC budget; `e_only` estimates the essential matrix only.
 struct OnlineMatchingOptions {
   int overlap = 10;
+  // Spatial candidates: VIO camera-center distance and optical-axis angle.
+  // Disabled when distance or angle is <= 0.
+  double spatial_max_distance = 10.0;
+  double spatial_max_angle_deg = 60.0;
+  // Keep the nearest N spatial candidates by camera-center distance.
+  // <=0 keeps every frame that passes distance / angle.
+  int spatial_max_num_images = 10;
   bool e_only = true;
   // Caps GPU max_num_matches together with Database::MaxNumKeypoints().
   int max_num_features_hint = 0;
@@ -68,9 +77,9 @@ struct OnlineMatchingOptions {
   }
 };
 
-// Online 1-to-N matching: current keyframe vs temporal overlap, then
-// WriteMatches / WriteTwoViewGeometry. Owns the sliding feature window,
-// Faiss index cache, and GPU or CPU matcher workers.
+// Online 1-to-N matching: current keyframe vs temporal overlap and spatial
+// neighbors, then WriteMatches / WriteTwoViewGeometry. Owns the sliding
+// feature window, Faiss index cache, and GPU or CPU matcher workers.
 class OnlineFeatureMatcher {
  public:
   OnlineFeatureMatcher(std::string database_path,
@@ -83,8 +92,11 @@ class OnlineFeatureMatcher {
   void PutFeatures(image_t image_id,
                    std::shared_ptr<const FeatureKeypoints> keypoints,
                    std::shared_ptr<const FeatureDescriptors> descriptors);
+  void PutPosePrior(image_t image_id, const Rigid3d& cam_from_world);
 
   bool MatchAndWrite(image_t image_id, const DatabaseCache& cache);
+
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
  private:
   struct FeatureCacheEntry {
@@ -94,9 +106,16 @@ class OnlineFeatureMatcher {
   struct CpuMatchContext;
 
   bool InitMatchers();
-  FeatureCacheEntry LoadFeatures(Database& database, image_t image_id);
+  FeatureCacheEntry LoadFeatures(Database& database,
+                                 image_t image_id,
+                                 bool remember);
   std::vector<image_t> SelectTemporalOverlapImages(
       image_t image_id, const DatabaseCache& cache) const;
+  std::vector<image_t> SelectSpatialImages(
+      image_t image_id,
+      const DatabaseCache& cache,
+      const std::unordered_set<image_t>& excluded) const;
+  bool SpatialEnabled() const;
 
   std::string database_path_;
   OnlineMatchingOptions options_;
@@ -105,6 +124,9 @@ class OnlineFeatureMatcher {
   std::unique_ptr<TimingStats> timing_;
   std::unordered_map<image_t, FeatureCacheEntry> feature_cache_;
   std::deque<image_t> feature_cache_order_;
+  std::unordered_map<image_t, Rigid3d> pose_priors_;
+  std::vector<image_t> last_temporal_ids_;
+  std::vector<image_t> last_spatial_ids_;
 };
 
 }  // namespace colmap

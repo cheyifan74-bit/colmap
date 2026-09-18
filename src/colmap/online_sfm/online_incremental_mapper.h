@@ -32,6 +32,7 @@
 #include "colmap/geometry/rigid3.h"
 #include "colmap/online_sfm/online_feature_extractor.h"
 #include "colmap/online_sfm/online_feature_matcher.h"
+#include "colmap/online_sfm/online_mapper.h"
 #include "colmap/scene/database_cache.h"
 #include "colmap/util/eigen_alignment.h"
 #include "colmap/util/types.h"
@@ -39,22 +40,28 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_set>
 
 namespace colmap {
 
-// Online wrapper around incremental SfM. Each Process() call currently:
-//   path-lock Open -> full DatabaseCache::Load (load_all_images) -> Close
-//   extract -> path-lock Open -> WriteKeypoints / WriteDescriptors -> Close
-//   match current vs previous overlap images -> WriteMatches / WriteTwoViewGeometry
-// P3P / triangulate / local BA are added in later steps.
-// VIO pose is stored as a prior only; it is not written as a registered pose.
+// Online wrapper around incremental SfM. Each Process() call:
+//   incrementally update DatabaseCache / correspondence graph
+//   extract -> WriteKeypoints / WriteDescriptors
+//   match current vs temporal overlap + spatial neighbors
+//   MappingCurrentImage: VIO init or P3P (+ map-frame VIO fallback) -> triangulate -> local BA
+//   LBA: first-level covisible KFs (shared 3D tracks) are variable; other KFs
+//   that observe the same local points are constant
+//   write sparse
+// VIO pose is a prior: used to seed metric init and as map-frame register fallback.
 class OnlineIncrementalMapper {
  public:
   explicit OnlineIncrementalMapper(
       std::string database_path,
       FeatureExtractionOptions extraction_options =
           FeatureExtractionOptions(FeatureExtractorType::SIFT),
-      OnlineMatchingOptions matching_options = {});
+      OnlineMatchingOptions matching_options = {},
+      std::string sparse_path = {},
+      OnlineMapperOptions mapper_options = {});
   ~OnlineIncrementalMapper();
 
   OnlineIncrementalMapper(const OnlineIncrementalMapper&) = delete;
@@ -77,10 +84,19 @@ class OnlineIncrementalMapper {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
  private:
+  bool EnsureCache();
+  bool SeedCameras();
+  bool IngestImage(image_t image_id);
+  bool IngestTwoViewGeometries(image_t image_id);
+
   std::string database_path_;
+  std::string sparse_path_;
+  OnlineMatchingOptions matching_options_;
   std::shared_ptr<DatabaseCache> cache_;
   std::unique_ptr<OnlineFeatureExtractor> extractor_;
   std::unique_ptr<OnlineFeatureMatcher> matcher_;
+  std::unique_ptr<OnlineMapper> mapper_;
+  std::unordered_set<image_pair_t> ingested_pairs_;
   image_t last_image_id_ = kInvalidImageId;
   std::string last_image_abs_path_;
   std::optional<Rigid3d> last_cam_from_world_prior_;

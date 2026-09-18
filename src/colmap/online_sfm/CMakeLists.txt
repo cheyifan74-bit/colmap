@@ -36,6 +36,7 @@ COLMAP_ADD_LIBRARY(
         online_feature_extractor.h online_feature_extractor.cc
         online_feature_matcher.h online_feature_matcher.cc
         online_incremental_mapper.h online_incremental_mapper.cc
+        online_mapper.h online_mapper.cc
         timing_stats.h timing_stats.cc
     PUBLIC_LINK_LIBS
         colmap_sfm
@@ -44,6 +45,7 @@ COLMAP_ADD_LIBRARY(
         colmap_estimators
         colmap_geometry
         colmap_util
+        Ceres::ceres
     PRIVATE_LINK_LIBS
         colmap_sensor
 )

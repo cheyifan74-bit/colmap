@@ -176,12 +176,24 @@ bool OnlineFeatureExtractor::ExtractAndWrite(
   timing_->Record(std::to_string(image_id),
                   {std::to_string(keypoints->size()), image_abs_path});
 
-  if (cache.ExistsImage(image_id)) {
-    const Image& image = cache.Image(image_id);
-    if (image.HasCameraId() && cache.ExistsCamera(image.CameraId())) {
-      ScaleKeypointsToCamera(
-          bitmap, cache.Camera(image.CameraId()), keypoints.get());
+  const Camera* camera = nullptr;
+  if (cache.ExistsImage(image_id) && cache.Image(image_id).HasCameraId() &&
+      cache.ExistsCamera(cache.Image(image_id).CameraId())) {
+    camera = &cache.Camera(cache.Image(image_id).CameraId());
+  } else {
+    try {
+      DatabaseSession session(database_path_);
+      if (session->ExistsImage(image_id)) {
+        const class Image image = session->ReadImage(image_id);
+        if (image.HasCameraId() && cache.ExistsCamera(image.CameraId())) {
+          camera = &cache.Camera(image.CameraId());
+        }
+      }
+    } catch (const std::exception&) {
     }
+  }
+  if (camera != nullptr) {
+    ScaleKeypointsToCamera(bitmap, *camera, keypoints.get());
   }
 
   try {

@@ -34,6 +34,7 @@
 #include "colmap/feature/index.h"
 #include "colmap/feature/sift.h"
 #include "colmap/feature/utils.h"
+#include "colmap/math/math.h"
 #include "colmap/online_sfm/timing_stats.h"
 #include "colmap/optim/loransac.h"
 #include "colmap/scene/database_session.h"
@@ -42,6 +43,10 @@
 #include "colmap/util/logging.h"
 #include "colmap/util/threading.h"
 #include "colmap/util/timer.h"
+
+#include <algorithm>
+#include <cmath>
+#include <unordered_set>
 
 #include <algorithm>
 #include <exception>
@@ -149,6 +154,12 @@ std::unique_ptr<TimingStats> CreateMatchTiming(
                      : "0");
   stats->AddMeta("gpu_index", options.matching.gpu_index);
   stats->AddMeta("overlap", std::to_string(options.overlap));
+  stats->AddMeta("spatial_max_distance",
+                 std::to_string(options.spatial_max_distance));
+  stats->AddMeta("spatial_max_angle_deg",
+                 std::to_string(options.spatial_max_angle_deg));
+  stats->AddMeta("spatial_max_num_images",
+                 std::to_string(options.spatial_max_num_images));
   stats->AddMeta("min_num_inliers",
                  std::to_string(options.geometry.min_num_inliers));
   stats->AddMeta("e_only", options.e_only ? "1" : "0");
@@ -301,8 +312,21 @@ void OnlineFeatureMatcher::PutFeatures(
   }
 }
 
+void OnlineFeatureMatcher::PutPosePrior(const image_t image_id,
+                                        const Rigid3d& cam_from_world) {
+  if (image_id == kInvalidImageId) {
+    return;
+  }
+  pose_priors_[image_id] = cam_from_world;
+}
+
+bool OnlineFeatureMatcher::SpatialEnabled() const {
+  return options_.spatial_max_distance > 0.0 &&
+         options_.spatial_max_angle_deg > 0.0;
+}
+
 OnlineFeatureMatcher::FeatureCacheEntry OnlineFeatureMatcher::LoadFeatures(
-    Database& database, const image_t image_id) {
+    Database& database, const image_t image_id, const bool remember) {
   const auto cached = feature_cache_.find(image_id);
   if (cached != feature_cache_.end()) {
     return cached->second;
@@ -316,8 +340,11 @@ OnlineFeatureMatcher::FeatureCacheEntry OnlineFeatureMatcher::LoadFeatures(
       std::make_shared<FeatureKeypoints>(database.ReadKeypoints(image_id));
   auto descriptors =
       std::make_shared<FeatureDescriptors>(database.ReadDescriptors(image_id));
-  PutFeatures(image_id, keypoints, descriptors);
-  return FeatureCacheEntry{std::move(keypoints), std::move(descriptors)};
+  FeatureCacheEntry entry{keypoints, descriptors};
+  if (remember) {
+    PutFeatures(image_id, std::move(keypoints), std::move(descriptors));
+  }
+  return entry;
 }
 
 std::vector<image_t> OnlineFeatureMatcher::SelectTemporalOverlapImages(
@@ -340,6 +367,75 @@ std::vector<image_t> OnlineFeatureMatcher::SelectTemporalOverlapImages(
                        previous_ids.end() - options_.overlap);
   }
   return previous_ids;
+}
+
+std::vector<image_t> OnlineFeatureMatcher::SelectSpatialImages(
+    const image_t image_id,
+    const DatabaseCache& cache,
+    const std::unordered_set<image_t>& excluded) const {
+  std::vector<image_t> spatial_ids;
+  if (!SpatialEnabled()) {
+    return spatial_ids;
+  }
+  const auto current_prior = pose_priors_.find(image_id);
+  if (current_prior == pose_priors_.end()) {
+    return spatial_ids;
+  }
+
+  const Eigen::Vector3d current_center = current_prior->second.TgtOriginInSrc();
+  const Eigen::Vector3d current_fwd =
+      (Inverse(current_prior->second).rotation() * Eigen::Vector3d::UnitZ())
+          .normalized();
+  const double max_distance = options_.spatial_max_distance;
+  const double max_angle_rad = DegToRad(options_.spatial_max_angle_deg);
+
+  struct Candidate {
+    image_t id = kInvalidImageId;
+    double dist = 0.0;
+  };
+  std::vector<Candidate> candidates;
+  for (const auto& [id, image] : cache.Images()) {
+    (void)image;
+    if (id >= image_id || excluded.count(id) > 0) {
+      continue;
+    }
+    const auto prior = pose_priors_.find(id);
+    if (prior == pose_priors_.end()) {
+      continue;
+    }
+    const Eigen::Vector3d center = prior->second.TgtOriginInSrc();
+    const double dist = (center - current_center).norm();
+    if (dist > max_distance) {
+      continue;
+    }
+    const Eigen::Vector3d fwd =
+        (Inverse(prior->second).rotation() * Eigen::Vector3d::UnitZ())
+            .normalized();
+    const double angle =
+        std::acos(std::clamp(current_fwd.dot(fwd), -1.0, 1.0));
+    if (angle > max_angle_rad) {
+      continue;
+    }
+    candidates.push_back({id, dist});
+  }
+  std::sort(candidates.begin(),
+            candidates.end(),
+            [](const Candidate& a, const Candidate& b) {
+              if (a.dist != b.dist) {
+                return a.dist < b.dist;
+              }
+              return a.id < b.id;
+            });
+  if (options_.spatial_max_num_images > 0 &&
+      candidates.size() >
+          static_cast<size_t>(options_.spatial_max_num_images)) {
+    candidates.resize(static_cast<size_t>(options_.spatial_max_num_images));
+  }
+  spatial_ids.reserve(candidates.size());
+  for (const auto& candidate : candidates) {
+    spatial_ids.push_back(candidate.id);
+  }
+  return spatial_ids;
 }
 
 bool OnlineFeatureMatcher::InitMatchers() {
@@ -380,7 +476,11 @@ bool OnlineFeatureMatcher::InitMatchers() {
                << FeatureMatcherTypeToString(options_.matching.type)
                << " use_gpu=" << options_.matching.use_gpu
                << " gpu_index=" << options_.matching.gpu_index
-               << " overlap=" << options_.overlap;
+               << " overlap=" << options_.overlap
+               << " spatial_max_distance=" << options_.spatial_max_distance
+               << " spatial_max_angle_deg=" << options_.spatial_max_angle_deg
+               << " spatial_max_num_images="
+               << options_.spatial_max_num_images;
     return false;
   }
 
@@ -405,14 +505,16 @@ bool OnlineFeatureMatcher::InitMatchers() {
               << FeatureMatcherTypeToString(options_.matching.type)
               << " use_gpu=1 gpu_index=" << options_.matching.gpu_index
               << " max_num_matches=" << options_.matching.max_num_matches
-              << " overlap=" << options_.overlap;
+              << " overlap=" << options_.overlap
+              << " spatial_max_distance=" << options_.spatial_max_distance
+              << " spatial_max_angle_deg=" << options_.spatial_max_angle_deg
+              << " spatial_max_num_images="
+              << options_.spatial_max_num_images;
     return true;
   }
 
-  const int num_workers = std::max(
-      1,
-      std::min(GetEffectiveNumThreads(options_.matching.num_threads),
-               std::max(options_.overlap, 1)));
+  const int num_workers =
+      std::max(1, GetEffectiveNumThreads(options_.matching.num_threads));
   cpu_match_ = std::make_unique<CpuMatchContext>();
 
   const bool brute_force = options_.matching.sift->cpu_brute_force_matcher;
@@ -465,25 +567,33 @@ bool OnlineFeatureMatcher::InitMatchers() {
             << " use_gpu=0 cpu_workers=" << num_workers
             << " brute_force="
             << options_.matching.sift->cpu_brute_force_matcher
-            << " overlap=" << options_.overlap;
+            << " overlap=" << options_.overlap
+            << " spatial_max_distance=" << options_.spatial_max_distance
+            << " spatial_max_angle_deg=" << options_.spatial_max_angle_deg
+            << " spatial_max_num_images="
+            << options_.spatial_max_num_images;
   return true;
 }
 
 bool OnlineFeatureMatcher::MatchAndWrite(const image_t image_id,
                                          const DatabaseCache& cache) {
-  if (options_.overlap <= 0) {
-    LOG(INFO) << "OnlineFeatureMatcher: skip match, overlap="
-              << options_.overlap;
-    return true;
-  }
-
-  const std::vector<image_t> previous_ids =
-      SelectTemporalOverlapImages(image_id, cache);
+  last_temporal_ids_ = SelectTemporalOverlapImages(image_id, cache);
+  const std::vector<image_t>& temporal_ids = last_temporal_ids_;
+  std::unordered_set<image_t> temporal_set(temporal_ids.begin(),
+                                           temporal_ids.end());
+  last_spatial_ids_ = SelectSpatialImages(image_id, cache, temporal_set);
+  const std::vector<image_t>& spatial_ids = last_spatial_ids_;
+  std::vector<image_t> previous_ids = temporal_ids;
+  previous_ids.insert(
+      previous_ids.end(), spatial_ids.begin(), spatial_ids.end());
   if (previous_ids.empty()) {
     LOG(INFO) << "OnlineFeatureMatcher: skip match, image " << image_id
-              << " has no previous keyframes";
+              << " has no temporal/spatial candidates";
     return true;
   }
+  LOG(INFO) << "OnlineFeatureMatcher: image " << image_id
+            << " candidates temporal=" << temporal_ids.size()
+            << " spatial=" << spatial_ids.size();
 
   if (!InitMatchers()) {
     return false;
@@ -500,7 +610,7 @@ bool OnlineFeatureMatcher::MatchAndWrite(const image_t image_id,
   std::vector<PairWork> jobs;
   try {
     DatabaseSession session(database_path_);
-    current = LoadFeatures(*session, image_id);
+    current = LoadFeatures(*session, image_id, /*remember=*/true);
     if (!current.keypoints || !current.descriptors ||
         current.keypoints->empty() || current.descriptors->data.rows() == 0) {
       LOG(WARNING) << "OnlineFeatureMatcher: skip match, image " << image_id
@@ -549,7 +659,8 @@ bool OnlineFeatureMatcher::MatchAndWrite(const image_t image_id,
 
       PairWork work;
       work.prev_id = prev_id;
-      work.previous = LoadFeatures(*session, prev_id);
+      work.previous = LoadFeatures(
+          *session, prev_id, /*remember=*/temporal_set.count(prev_id) > 0);
       if (!work.previous.keypoints || !work.previous.descriptors ||
           work.previous.keypoints->empty() ||
           work.previous.descriptors->data.rows() == 0) {
@@ -569,6 +680,27 @@ bool OnlineFeatureMatcher::MatchAndWrite(const image_t image_id,
   if (jobs.empty()) {
     return true;
   }
+
+  for (const PairWork& job : jobs) {
+    if (feature_cache_.find(job.prev_id) == feature_cache_.end()) {
+      feature_cache_[job.prev_id] = job.previous;
+    }
+  }
+  auto unpin_spatial = [&]() {
+    for (const image_t spatial_id : spatial_ids) {
+      const bool kept =
+          std::find(feature_cache_order_.begin(),
+                    feature_cache_order_.end(),
+                    spatial_id) != feature_cache_order_.end();
+      if (kept) {
+        continue;
+      }
+      feature_cache_.erase(spatial_id);
+      if (cpu_match_ && cpu_match_->index_cache) {
+        cpu_match_->index_cache->Evict(spatial_id);
+      }
+    }
+  };
 
   const FeatureMatcher::Image curr_image{
       image_id, camera_cur, current.keypoints, current.descriptors};
@@ -603,6 +735,7 @@ bool OnlineFeatureMatcher::MatchAndWrite(const image_t image_id,
       }
     } catch (const std::exception& e) {
       LOG(ERROR) << "OnlineFeatureMatcher: CPU matching failed: " << e.what();
+      unpin_spatial();
       return false;
     }
   } else {
@@ -631,9 +764,11 @@ bool OnlineFeatureMatcher::MatchAndWrite(const image_t image_id,
   } catch (const std::exception& e) {
     LOG(ERROR) << "OnlineFeatureMatcher: failed to write matches: "
                << e.what();
+    unpin_spatial();
     return false;
   }
 
+  unpin_spatial();
   return true;
 }
 
