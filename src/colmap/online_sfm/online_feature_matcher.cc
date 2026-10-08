@@ -287,7 +287,7 @@ OnlineFeatureMatcher::OnlineFeatureMatcher(std::string database_path,
 
 OnlineFeatureMatcher::~OnlineFeatureMatcher() = default;
 
-void OnlineFeatureMatcher::PutFeatures(
+void OnlineFeatureMatcher::CacheFeatures(
     const image_t image_id,
     std::shared_ptr<const FeatureKeypoints> keypoints,
     std::shared_ptr<const FeatureDescriptors> descriptors) {
@@ -342,7 +342,7 @@ OnlineFeatureMatcher::FeatureCacheEntry OnlineFeatureMatcher::LoadFeatures(
       std::make_shared<FeatureDescriptors>(database.ReadDescriptors(image_id));
   FeatureCacheEntry entry{keypoints, descriptors};
   if (remember) {
-    PutFeatures(image_id, std::move(keypoints), std::move(descriptors));
+    CacheFeatures(image_id, std::move(keypoints), std::move(descriptors));
   }
   return entry;
 }
@@ -594,6 +594,35 @@ bool OnlineFeatureMatcher::MatchAndWrite(const image_t image_id,
   LOG(INFO) << "OnlineFeatureMatcher: image " << image_id
             << " candidates temporal=" << temporal_ids.size()
             << " spatial=" << spatial_ids.size();
+  return MatchPairsAndWrite(
+      image_id, previous_ids, cache, temporal_set, /*rematch_weak=*/false);
+}
+
+bool OnlineFeatureMatcher::MatchSpecificPairs(
+    const image_t image_id,
+    const std::vector<image_t>& other_ids,
+    const DatabaseCache& cache) {
+  if (other_ids.empty()) {
+    return true;
+  }
+  LOG(INFO) << "OnlineFeatureMatcher: image " << image_id
+            << " specific pairs=" << other_ids.size();
+  return MatchPairsAndWrite(image_id,
+                            other_ids,
+                            cache,
+                            /*remember_ids=*/{},
+                            /*rematch_weak=*/true);
+}
+
+bool OnlineFeatureMatcher::MatchPairsAndWrite(
+    const image_t image_id,
+    const std::vector<image_t>& previous_ids,
+    const DatabaseCache& cache,
+    const std::unordered_set<image_t>& remember_ids,
+    const bool rematch_weak) {
+  if (previous_ids.empty()) {
+    return true;
+  }
 
   if (!InitMatchers()) {
     return false;
@@ -645,7 +674,16 @@ bool OnlineFeatureMatcher::MatchAndWrite(const image_t image_id,
 
       const bool exists_matches = session->ExistsMatches(prev_id, image_id);
       const bool exists_tvg = session->ExistsTwoViewGeometry(prev_id, image_id);
-      if (exists_matches && exists_tvg) {
+      bool existing_usable = false;
+      if (exists_tvg) {
+        const TwoViewGeometry existing =
+            session->ReadTwoViewGeometry(prev_id, image_id);
+        existing_usable =
+            existing.config != TwoViewGeometry::ConfigurationType::DEGENERATE &&
+            existing.inlier_matches.size() >=
+                static_cast<size_t>(options_.geometry.min_num_inliers);
+      }
+      if (exists_matches && exists_tvg && (!rematch_weak || existing_usable)) {
         LOG(INFO) << "OnlineFeatureMatcher: skip pair " << prev_id << "-"
                   << image_id << ", already matched";
         continue;
@@ -660,7 +698,7 @@ bool OnlineFeatureMatcher::MatchAndWrite(const image_t image_id,
       PairWork work;
       work.prev_id = prev_id;
       work.previous = LoadFeatures(
-          *session, prev_id, /*remember=*/temporal_set.count(prev_id) > 0);
+          *session, prev_id, /*remember=*/remember_ids.count(prev_id) > 0);
       if (!work.previous.keypoints || !work.previous.descriptors ||
           work.previous.keypoints->empty() ||
           work.previous.descriptors->data.rows() == 0) {
@@ -686,18 +724,21 @@ bool OnlineFeatureMatcher::MatchAndWrite(const image_t image_id,
       feature_cache_[job.prev_id] = job.previous;
     }
   }
-  auto unpin_spatial = [&]() {
-    for (const image_t spatial_id : spatial_ids) {
+  auto unpin_unremembered = [&]() {
+    for (const image_t prev_id : previous_ids) {
+      if (remember_ids.count(prev_id) > 0) {
+        continue;
+      }
       const bool kept =
           std::find(feature_cache_order_.begin(),
                     feature_cache_order_.end(),
-                    spatial_id) != feature_cache_order_.end();
+                    prev_id) != feature_cache_order_.end();
       if (kept) {
         continue;
       }
-      feature_cache_.erase(spatial_id);
+      feature_cache_.erase(prev_id);
       if (cpu_match_ && cpu_match_->index_cache) {
-        cpu_match_->index_cache->Evict(spatial_id);
+        cpu_match_->index_cache->Evict(prev_id);
       }
     }
   };
@@ -735,7 +776,7 @@ bool OnlineFeatureMatcher::MatchAndWrite(const image_t image_id,
       }
     } catch (const std::exception& e) {
       LOG(ERROR) << "OnlineFeatureMatcher: CPU matching failed: " << e.what();
-      unpin_spatial();
+      unpin_unremembered();
       return false;
     }
   } else {
@@ -764,11 +805,11 @@ bool OnlineFeatureMatcher::MatchAndWrite(const image_t image_id,
   } catch (const std::exception& e) {
     LOG(ERROR) << "OnlineFeatureMatcher: failed to write matches: "
                << e.what();
-    unpin_spatial();
+    unpin_unremembered();
     return false;
   }
 
-  unpin_spatial();
+  unpin_unremembered();
   return true;
 }
 

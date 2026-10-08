@@ -89,12 +89,18 @@ class OnlineFeatureMatcher {
   OnlineFeatureMatcher(const OnlineFeatureMatcher&) = delete;
   OnlineFeatureMatcher& operator=(const OnlineFeatureMatcher&) = delete;
 
-  void PutFeatures(image_t image_id,
-                   std::shared_ptr<const FeatureKeypoints> keypoints,
-                   std::shared_ptr<const FeatureDescriptors> descriptors);
+  void CacheFeatures(image_t image_id,
+                     std::shared_ptr<const FeatureKeypoints> keypoints,
+                     std::shared_ptr<const FeatureDescriptors> descriptors);
   void PutPosePrior(image_t image_id, const Rigid3d& cam_from_world);
 
   bool MatchAndWrite(image_t image_id, const DatabaseCache& cache);
+
+  // Match `image_id` against explicit partners and write matches / TVG.
+  // Weak existing pairs (degenerate or too few inliers) are rematched.
+  bool MatchSpecificPairs(image_t image_id,
+                          const std::vector<image_t>& other_ids,
+                          const DatabaseCache& cache);
 
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
@@ -116,6 +122,11 @@ class OnlineFeatureMatcher {
       const DatabaseCache& cache,
       const std::unordered_set<image_t>& excluded) const;
   bool SpatialEnabled() const;
+  bool MatchPairsAndWrite(image_t image_id,
+                          const std::vector<image_t>& previous_ids,
+                          const DatabaseCache& cache,
+                          const std::unordered_set<image_t>& remember_ids,
+                          bool rematch_weak);
 
   std::string database_path_;
   OnlineMatchingOptions options_;

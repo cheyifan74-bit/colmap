@@ -75,6 +75,11 @@ class ObservationManager {
   // images for image pair stats update.
   void AddImage(image_t image_id);
 
+  // Refresh pair / image correspondence counts after a late AddTwoViewGeometry
+  // between two images that are already in this manager. No-op if either
+  // image is missing or the graph has no matches for the pair.
+  void AddImagePair(image_t image_id1, image_t image_id2);
+
   // Add new 3D object, and return its unique ID.
   point3D_t AddPoint3D(
       const Eigen::Vector3d& xyz,

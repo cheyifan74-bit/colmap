@@ -95,6 +95,8 @@ class Database {
                                bool is_deprecated_image_prior = true) const = 0;
   virtual bool ExistsKeypoints(image_t image_id) const = 0;
   virtual bool ExistsDescriptors(image_t image_id) const = 0;
+  // Online MixVPR 512-D global descriptor (one row per image).
+  virtual bool ExistsMixVprDescriptor(image_t image_id) const = 0;
   virtual bool ExistsMatches(image_t image_id1, image_t image_id2) const = 0;
   virtual bool ExistsTwoViewGeometry(image_t image_id1,
                                      image_t image_id2) const = 0;
@@ -173,6 +175,12 @@ class Database {
   virtual FeatureKeypointsBlob ReadKeypointsBlob(image_t image_id) const = 0;
   virtual FeatureKeypoints ReadKeypoints(image_t image_id) const = 0;
   virtual FeatureDescriptors ReadDescriptors(image_t image_id) const = 0;
+  virtual Eigen::VectorXf ReadMixVprDescriptor(image_t image_id) const = 0;
+  virtual std::vector<std::pair<image_t, Eigen::VectorXf>>
+  ReadMixVprDescriptors(const std::vector<image_t>& image_ids) const;
+  virtual std::vector<std::pair<image_t, Eigen::VectorXf>>
+  ReadAllMixVprDescriptors() const = 0;
+  virtual size_t NumMixVprDescriptors() const = 0;
 
   virtual FeatureMatchesBlob ReadMatchesBlob(image_t image_id1,
                                              image_t image_id2) const = 0;
@@ -225,6 +233,9 @@ class Database {
                               const FeatureKeypointsBlob& blob) = 0;
   virtual void WriteDescriptors(image_t image_id,
                                 const FeatureDescriptors& descriptors) = 0;
+  // INSERT OR REPLACE one L2-normalized MixVPR descriptor for `image_id`.
+  virtual void WriteMixVprDescriptor(image_t image_id,
+                                     const Eigen::VectorXf& descriptor) = 0;
   virtual void WriteMatches(image_t image_id1,
                             image_t image_id2,
                             const FeatureMatches& matches) = 0;

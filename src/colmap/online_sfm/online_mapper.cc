@@ -139,54 +139,56 @@ void AppendPoseColumns(std::ostream& out, const Rigid3d& pose) {
 
 }  // namespace
 
-OnlineMapper::OnlineMapper(std::shared_ptr<DatabaseCache> cache,
+OnlineMapper::OnlineMapper(std::shared_ptr<DatabaseCache> database_cache,
                            std::string sparse_path,
                            OnlineMapperOptions options)
-    : cache_(std::move(cache)),
+    : database_cache_(std::move(database_cache)),
       sparse_path_(std::move(sparse_path)),
-      options_(std::move(options)),
+      options_(options),
       reconstruction_(std::make_shared<Reconstruction>()) {}
 
 OnlineMapper::~OnlineMapper() = default;
 
-bool OnlineMapper::EnsureReady() {
+bool OnlineMapper::InitReconstruction() {
   if (obs_manager_ && triangulator_) {
     return true;
   }
-  if (!cache_ || cache_->NumImages() == 0) {
-    LOG(ERROR) << "OnlineMapper: cache has no images";
+  if (!database_cache_ || database_cache_->NumImages() == 0) {
+    LOG(ERROR) << "OnlineMapper: database cache has no images";
     return false;
   }
-  reconstruction_->Load(*cache_);
+  reconstruction_->Load(*database_cache_);
   obs_manager_ = std::make_shared<ObservationManager>(
-      *reconstruction_, cache_->CorrespondenceGraph());
+      *reconstruction_, database_cache_->CorrespondenceGraph());
   triangulator_ = std::make_shared<IncrementalTriangulator>(
-      cache_->CorrespondenceGraph(), *reconstruction_, obs_manager_);
-  for (const auto& [image_id, image] : reconstruction_->Images()) {
-    (void)image;
-    synced_images_.insert(image_id);
-  }
+      database_cache_->CorrespondenceGraph(), *reconstruction_, obs_manager_);
   LOG(INFO) << "OnlineMapper: reconstruction ready with "
             << reconstruction_->NumImages() << " image(s)";
   return true;
 }
 
 bool OnlineMapper::SyncReconstruction() {
-  if (!cache_) {
+  if (!database_cache_) {
     return false;
   }
   if (!obs_manager_) {
-    return EnsureReady();
+    return InitReconstruction();
   }
 
-  reconstruction_->Load(*cache_);
-  for (const auto& [image_id, image] : reconstruction_->Images()) {
-    (void)image;
-    if (synced_images_.insert(image_id).second) {
-      obs_manager_->AddImage(image_id);
-    }
+  const std::vector<image_t> new_image_ids =
+      reconstruction_->Load(*database_cache_);
+  for (const image_t image_id : new_image_ids) {
+    obs_manager_->AddImage(image_id);
   }
   return true;
+}
+
+void OnlineMapper::NotifyNewImagePair(const image_t image_id1,
+                                      const image_t image_id2) {
+  if (!obs_manager_) {
+    return;
+  }
+  obs_manager_->AddImagePair(image_id1, image_id2);
 }
 
 bool OnlineMapper::RegisterImageWithKnownPose(const image_t image_id,
@@ -274,7 +276,7 @@ OnlineMapper::P3PRegisterResult OnlineMapper::RegisterNextImageP3P(
   }
 
   Camera& camera = *image.CameraPtr();
-  const auto correspondence_graph = cache_->CorrespondenceGraph();
+  const auto correspondence_graph = database_cache_->CorrespondenceGraph();
   if (!correspondence_graph) {
     return result;
   }
@@ -390,12 +392,12 @@ OnlineMapper::P3PRegisterResult OnlineMapper::RegisterNextImageP3P(
 }
 
 image_t OnlineMapper::FindInitPartner(const image_t image_id) const {
-  if (!cache_->CorrespondenceGraph()) {
+  if (!database_cache_->CorrespondenceGraph()) {
     return kInvalidImageId;
   }
   image_t best_id = kInvalidImageId;
-  const auto graph = cache_->CorrespondenceGraph();
-  for (const auto& [prev_id, image] : cache_->Images()) {
+  const auto graph = database_cache_->CorrespondenceGraph();
+  for (const auto& [prev_id, image] : database_cache_->Images()) {
     (void)image;
     if (prev_id >= image_id) {
       continue;
@@ -884,7 +886,7 @@ bool OnlineMapper::MappingCurrentImage(const image_t image_id,
   }
   if (!registered) {
     LOG(WARNING) << "OnlineMapper: skip mapping image " << image_id
-                 << ", no P3P and no VIO prior";
+                 << ", P3P disabled and no VIO prior";
     return true;
   }
 

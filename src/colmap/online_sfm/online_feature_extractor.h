@@ -32,6 +32,7 @@
 #include "colmap/feature/extractor.h"
 #include "colmap/feature/types.h"
 #include "colmap/scene/database_cache.h"
+#include "colmap/sensor/bitmap.h"
 #include "colmap/util/types.h"
 
 #include <memory>
@@ -48,6 +49,7 @@ class OnlineFeatureExtractor {
   struct ExtractedFeatures {
     std::shared_ptr<const FeatureKeypoints> keypoints;
     std::shared_ptr<const FeatureDescriptors> descriptors;
+    Bitmap bitmap;
   };
 
   OnlineFeatureExtractor(std::string database_path,

@@ -32,6 +32,7 @@
 #include "colmap/geometry/rigid3.h"
 #include "colmap/online_sfm/online_feature_extractor.h"
 #include "colmap/online_sfm/online_feature_matcher.h"
+#include "colmap/online_sfm/online_loop_closer.h"
 #include "colmap/online_sfm/online_mapper.h"
 #include "colmap/scene/database_cache.h"
 #include "colmap/util/eigen_alignment.h"
@@ -41,6 +42,7 @@
 #include <optional>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 namespace colmap {
 
@@ -52,6 +54,7 @@ namespace colmap {
 //   LBA: first-level covisible KFs (shared 3D tracks) are variable; other KFs
 //   that observe the same local points are constant
 //   write sparse
+//   P0 loop closer: MixVPR retrieve + geometric verify, log / write loop pairs
 // VIO pose is a prior: used to seed metric init and as map-frame register fallback.
 class OnlineIncrementalMapper {
  public:
@@ -61,41 +64,43 @@ class OnlineIncrementalMapper {
           FeatureExtractionOptions(FeatureExtractorType::SIFT),
       OnlineMatchingOptions matching_options = {},
       std::string sparse_path = {},
-      OnlineMapperOptions mapper_options = {});
+      OnlineMapperOptions mapper_options = {},
+      OnlineLoopCloserOptions loop_options = {});
   ~OnlineIncrementalMapper();
 
   OnlineIncrementalMapper(const OnlineIncrementalMapper&) = delete;
   OnlineIncrementalMapper& operator=(const OnlineIncrementalMapper&) = delete;
 
-  // `image_id` must already exist in the database (WriteImage happened first).
-  // `cam_from_world_prior` is optional VIO left-camera pose in COLMAP convention.
-  bool Process(image_t image_id,
-               const std::string& image_abs_path,
+  bool Process(image_t image_id, const std::string& image_abs_path,
                const std::optional<Rigid3d>& cam_from_world_prior =
                    std::nullopt);
 
-  const std::shared_ptr<DatabaseCache>& Cache() const { return cache_; }
+  const std::shared_ptr<DatabaseCache>& GetDatabaseCache() const {
+    return database_cache_;
+  }
   image_t LastImageId() const { return last_image_id_; }
   const std::string& LastImageAbsPath() const { return last_image_abs_path_; }
   const std::optional<Rigid3d>& LastCamFromWorldPrior() const {
     return last_cam_from_world_prior_;
   }
+  const std::vector<OnlineLoopPair>& ConfirmedLoops() const;
 
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
  private:
-  bool EnsureCache();
-  bool SeedCameras();
+  bool InitDatabaseCache();
+  bool LoadCamerasFromDatabase();
   bool IngestImage(image_t image_id);
   bool IngestTwoViewGeometries(image_t image_id);
 
   std::string database_path_;
   std::string sparse_path_;
   OnlineMatchingOptions matching_options_;
-  std::shared_ptr<DatabaseCache> cache_;
+  std::shared_ptr<DatabaseCache> database_cache_;
   std::unique_ptr<OnlineFeatureExtractor> extractor_;
   std::unique_ptr<OnlineFeatureMatcher> matcher_;
   std::unique_ptr<OnlineMapper> mapper_;
+  std::unique_ptr<OnlineLoopCloser> loop_closer_;
   std::unordered_set<image_pair_t> ingested_pairs_;
   image_t last_image_id_ = kInvalidImageId;
   std::string last_image_abs_path_;

@@ -46,7 +46,8 @@ OnlineIncrementalMapper::OnlineIncrementalMapper(
     FeatureExtractionOptions extraction_options,
     OnlineMatchingOptions matching_options,
     std::string sparse_path,
-    OnlineMapperOptions mapper_options)
+    OnlineMapperOptions mapper_options,
+    OnlineLoopCloserOptions loop_options)
     : database_path_(std::move(database_path)),
       sparse_path_(std::move(sparse_path)),
       matching_options_(matching_options) {
@@ -54,55 +55,63 @@ OnlineIncrementalMapper::OnlineIncrementalMapper(
     matching_options_.max_num_features_hint =
         extraction_options.sift->max_num_features;
   }
-  cache_ = std::make_shared<DatabaseCache>();
+  database_cache_ = std::make_shared<DatabaseCache>();
   extractor_ = std::make_unique<OnlineFeatureExtractor>(
       database_path_, std::move(extraction_options));
   matcher_ = std::make_unique<OnlineFeatureMatcher>(
       database_path_, matching_options_);
   mapper_ = std::make_unique<OnlineMapper>(
-      cache_, sparse_path_, std::move(mapper_options));
+      database_cache_, sparse_path_, std::move(mapper_options));
+  loop_closer_ = std::make_unique<OnlineLoopCloser>(database_path_,
+                                                    std::move(loop_options));
 }
 
 OnlineIncrementalMapper::~OnlineIncrementalMapper() = default;
 
-bool OnlineIncrementalMapper::EnsureCache() {
-  if (cache_->NumCameras() > 0) {
-    return true;
-  }
-  return SeedCameras();
+const std::vector<OnlineLoopPair>& OnlineIncrementalMapper::ConfirmedLoops()
+    const {
+  static const std::vector<OnlineLoopPair> kEmpty;
+  return loop_closer_ ? loop_closer_->ConfirmedLoops() : kEmpty;
 }
 
-bool OnlineIncrementalMapper::SeedCameras() {
+bool OnlineIncrementalMapper::InitDatabaseCache() {
+  if (database_cache_->NumCameras() > 0) {
+    return true;
+  }
+  return LoadCamerasFromDatabase();
+}
+
+bool OnlineIncrementalMapper::LoadCamerasFromDatabase() {
   try {
     DatabaseSession session(database_path_);
     for (auto& camera : session->ReadAllCameras()) {
-      if (cache_->ExistsCamera(camera.camera_id)) {
+      if (database_cache_->ExistsCamera(camera.camera_id)) {
         continue;
       }
-      if (!cache_->ExistsRig(camera.camera_id)) {
+      if (!database_cache_->ExistsRig(camera.camera_id)) {
         class Rig rig;
         rig.SetRigId(camera.camera_id);
         rig.AddRefSensor(camera.SensorId());
-        cache_->AddRig(std::move(rig));
+        database_cache_->AddRig(std::move(rig));
       }
-      cache_->AddCamera(std::move(camera));
+      database_cache_->AddCamera(std::move(camera));
     }
   } catch (const std::exception& e) {
-    LOG(ERROR) << "OnlineIncrementalMapper: failed to seed cameras: "
+    LOG(ERROR) << "OnlineIncrementalMapper: failed to load cameras: "
                << e.what();
     return false;
   }
-  if (cache_->NumCameras() == 0) {
+  if (database_cache_->NumCameras() == 0) {
     LOG(ERROR) << "OnlineIncrementalMapper: database has no cameras";
     return false;
   }
-  LOG(INFO) << "OnlineIncrementalMapper: seeded " << cache_->NumCameras()
-            << " camera(s) into persistent cache";
+  LOG(INFO) << "OnlineIncrementalMapper: loaded " << database_cache_->NumCameras()
+            << " camera(s) into database cache";
   return true;
 }
 
 bool OnlineIncrementalMapper::IngestImage(const image_t image_id) {
-  if (cache_->ExistsImage(image_id)) {
+  if (database_cache_->ExistsImage(image_id)) {
     return true;
   }
 
@@ -116,7 +125,7 @@ bool OnlineIncrementalMapper::IngestImage(const image_t image_id) {
     }
 
     class Image image = session->ReadImage(image_id);
-    if (!image.HasCameraId() || !cache_->ExistsCamera(image.CameraId())) {
+    if (!image.HasCameraId() || !database_cache_->ExistsCamera(image.CameraId())) {
       LOG(ERROR) << "OnlineIncrementalMapper: image " << image_id
                  << " camera not in cache";
       return false;
@@ -138,14 +147,14 @@ bool OnlineIncrementalMapper::IngestImage(const image_t image_id) {
     if (!image.HasFrameId()) {
       image.SetFrameId(image.ImageId());
     }
-    if (!cache_->ExistsFrame(image.FrameId())) {
+    if (!database_cache_->ExistsFrame(image.FrameId())) {
       class Frame frame;
       frame.SetFrameId(image.FrameId());
       frame.SetRigId(camera_id);
       frame.AddDataId(image.DataId());
-      cache_->AddFrame(std::move(frame));
+      database_cache_->AddFrame(std::move(frame));
     }
-    cache_->AddImage(std::move(image));
+    database_cache_->AddImage(std::move(image));
   } catch (const std::exception& e) {
     LOG(ERROR) << "OnlineIncrementalMapper: ingest image " << image_id
                << " failed: " << e.what();
@@ -153,21 +162,21 @@ bool OnlineIncrementalMapper::IngestImage(const image_t image_id) {
   }
 
   LOG(INFO) << "OnlineIncrementalMapper: ingested image " << image_id
-            << " into persistent cache (num_images=" << cache_->NumImages()
+            << " into persistent cache (num_images=" << database_cache_->NumImages()
             << ")";
   return true;
 }
 
 bool OnlineIncrementalMapper::IngestTwoViewGeometries(const image_t image_id) {
-  if (!cache_->ExistsImage(image_id) || !cache_->CorrespondenceGraph()) {
+  if (!database_cache_->ExistsImage(image_id) || !database_cache_->CorrespondenceGraph()) {
     return true;
   }
 
   try {
     DatabaseSession session(database_path_);
-    auto graph = cache_->CorrespondenceGraph();
+    auto graph = database_cache_->CorrespondenceGraph();
     const int min_inliers = matching_options_.geometry.min_num_inliers;
-    for (const auto& [prev_id, image] : cache_->Images()) {
+    for (const auto& [prev_id, image] : database_cache_->Images()) {
       (void)image;
       if (prev_id == image_id) {
         continue;
@@ -190,6 +199,7 @@ bool OnlineIncrementalMapper::IngestTwoViewGeometries(const image_t image_id) {
         continue;
       }
       graph->AddTwoViewGeometry(prev_id, image_id, std::move(geometry));
+      // mapper_->NotifyNewImagePair(prev_id, image_id);
     }
   } catch (const std::exception& e) {
     LOG(ERROR) << "OnlineIncrementalMapper: ingest TVG for image " << image_id
@@ -200,8 +210,7 @@ bool OnlineIncrementalMapper::IngestTwoViewGeometries(const image_t image_id) {
 }
 
 bool OnlineIncrementalMapper::Process(
-    const image_t image_id,
-    const std::string& image_abs_path,
+    const image_t image_id, const std::string& image_abs_path,
     const std::optional<Rigid3d>& cam_from_world_prior) {
   if (database_path_.empty()) {
     LOG(ERROR) << "OnlineIncrementalMapper: empty database path";
@@ -211,7 +220,7 @@ bool OnlineIncrementalMapper::Process(
     LOG(ERROR) << "OnlineIncrementalMapper: invalid image_id";
     return false;
   }
-  if (!EnsureCache()) {
+  if (!InitDatabaseCache()) {
     return false;
   }
 
@@ -224,11 +233,11 @@ bool OnlineIncrementalMapper::Process(
 
   OnlineFeatureExtractor::ExtractedFeatures extracted;
   if (!extractor_->ExtractAndWrite(
-          image_id, image_abs_path, *cache_, &extracted)) {
+          image_id, image_abs_path, *database_cache_, &extracted)) {
     return false;
   }
   if (extracted.keypoints && extracted.descriptors) {
-    matcher_->PutFeatures(
+    matcher_->CacheFeatures(
         image_id, extracted.keypoints, extracted.descriptors);
   }
 
@@ -238,7 +247,7 @@ bool OnlineIncrementalMapper::Process(
     return true;
   }
 
-  if (!matcher_->MatchAndWrite(image_id, *cache_)) {
+  if (!matcher_->MatchAndWrite(image_id, *database_cache_)) {
     return false;
   }
   if (!IngestTwoViewGeometries(image_id)) {
@@ -247,6 +256,20 @@ bool OnlineIncrementalMapper::Process(
 
   if (!mapper_->MappingCurrentImage(image_id, cam_from_world_prior)) {
     return false;
+  }
+
+  if (loop_closer_ && loop_closer_->IsLoopClosureActive()) {
+    const bool corrected = loop_closer_->Process(
+        image_id,
+        image_abs_path,
+        *database_cache_,
+        mapper_->GetReconstruction(),
+        mapper_->GetObservationManager(),
+        matcher_.get(),
+        extracted.bitmap.IsEmpty() ? nullptr : &extracted.bitmap);
+    if (corrected) {
+      mapper_->WriteSparse();
+    }
   }
 
   return true;

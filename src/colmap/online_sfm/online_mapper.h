@@ -41,7 +41,6 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace colmap {
@@ -68,7 +67,7 @@ struct OnlineMapperOptions {
 // intrinsics).
 class OnlineMapper {
  public:
-  OnlineMapper(std::shared_ptr<DatabaseCache> cache,
+  OnlineMapper(std::shared_ptr<DatabaseCache> database_cache,
                std::string sparse_path,
                OnlineMapperOptions options = {});
   ~OnlineMapper();
@@ -76,21 +75,21 @@ class OnlineMapper {
   OnlineMapper(const OnlineMapper&) = delete;
   OnlineMapper& operator=(const OnlineMapper&) = delete;
 
-  // Pull new cameras / frames / images from the persistent cache into the
-  // Reconstruction and ObservationManager. Call after ingesting the current
-  // image and its two-view geometries into the cache/graph.
+ 
   bool SyncReconstruction();
 
-  // Map one newly ingested image: register (init / P3P / map-frame VIO),
-  // triangulate, local BA, write sparse. VIO prior is required for init and,
-  // on P3P failure, is composed onto the last mapped keyframe.
-  // Returns true unless a hard setup error occurred.
+
+  void NotifyNewImagePair(image_t image_id1, image_t image_id2);
+
+
   bool MappingCurrentImage(image_t image_id,
                            const std::optional<Rigid3d>& vio_prior);
 
   bool Initialized() const { return initialized_; }
   const Reconstruction& GetReconstruction() const { return *reconstruction_; }
   Reconstruction& GetReconstruction() { return *reconstruction_; }
+  ObservationManager* GetObservationManager() { return obs_manager_.get(); }
+  void WriteSparse() const;
 
  private:
   struct P3PRegisterResult {
@@ -99,7 +98,7 @@ class OnlineMapper {
     Rigid3d cam_from_world;
   };
 
-  bool EnsureReady();
+  bool InitReconstruction();
   bool RegisterImageWithKnownPose(image_t image_id,
                                   const Rigid3d& cam_from_world);
   P3PRegisterResult RegisterNextImageP3P(image_t image_id);
@@ -124,16 +123,14 @@ class OnlineMapper {
                            bool jumped,
                            bool reverted) const;
   image_t FindInitPartner(image_t image_id) const;
-  void WriteSparse() const;
 
-  std::shared_ptr<DatabaseCache> cache_;
+  std::shared_ptr<DatabaseCache> database_cache_;
   std::string sparse_path_;
   OnlineMapperOptions options_;
   std::shared_ptr<Reconstruction> reconstruction_;
   std::shared_ptr<ObservationManager> obs_manager_;
   std::shared_ptr<IncrementalTriangulator> triangulator_;
   std::unordered_map<image_t, Rigid3d> pose_priors_;
-  std::unordered_set<image_t> synced_images_;
   bool initialized_ = false;
 };
 

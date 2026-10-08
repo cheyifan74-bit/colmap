@@ -293,7 +293,7 @@ bool Reconstruction::IsValid() const {
   return true;
 }
 
-void Reconstruction::Load(const DatabaseCache& database_cache) {
+std::vector<image_t> Reconstruction::Load(const DatabaseCache& database_cache) {
   // Add cameras.
   cameras_.reserve(database_cache.NumCameras());
   for (const auto& [camera_id, camera] : database_cache.Cameras()) {
@@ -333,6 +333,10 @@ void Reconstruction::Load(const DatabaseCache& database_cache) {
 
   // Add images.
   images_.reserve(database_cache.NumImages());
+  std::vector<image_t> new_image_ids;
+  if (database_cache.NumImages() > NumImages()) {
+    new_image_ids.reserve(database_cache.NumImages() - NumImages());
+  }
 
   for (const auto& [image_id, image] : database_cache.Images()) {
     if (ExistsImage(image_id)) {
@@ -345,8 +349,10 @@ void Reconstruction::Load(const DatabaseCache& database_cache) {
       }
     } else {
       AddImage(image);
+      new_image_ids.push_back(image_id);
     }
   }
+  return new_image_ids;
 }
 
 void Reconstruction::TearDown() {

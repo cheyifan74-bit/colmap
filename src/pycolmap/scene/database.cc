@@ -82,6 +82,10 @@ class PyDatabaseImpl : public Database, py::trampoline_self_life_support {
     PYBIND11_OVERRIDE_PURE(bool, Database, ExistsDescriptors, image_id);
   }
 
+  bool ExistsMixVprDescriptor(image_t image_id) const override {
+    PYBIND11_OVERRIDE_PURE(bool, Database, ExistsMixVprDescriptor, image_id);
+  }
+
   bool ExistsMatches(image_t image_id1, image_t image_id2) const override {
     PYBIND11_OVERRIDE_PURE(bool, Database, ExistsMatches, image_id1, image_id2);
   }
@@ -134,6 +138,10 @@ class PyDatabaseImpl : public Database, py::trampoline_self_life_support {
 
   size_t NumDescriptorsForImage(image_t image_id) const override {
     PYBIND11_OVERRIDE_PURE(size_t, Database, NumDescriptorsForImage, image_id);
+  }
+
+  size_t NumMixVprDescriptors() const override {
+    PYBIND11_OVERRIDE_PURE(size_t, Database, NumMixVprDescriptors);
   }
 
   size_t NumMatches() const override {
@@ -223,6 +231,17 @@ class PyDatabaseImpl : public Database, py::trampoline_self_life_support {
         FeatureDescriptors, Database, ReadDescriptors, image_id);
   }
 
+  Eigen::VectorXf ReadMixVprDescriptor(image_t image_id) const override {
+    PYBIND11_OVERRIDE_PURE(
+        Eigen::VectorXf, Database, ReadMixVprDescriptor, image_id);
+  }
+
+  std::vector<std::pair<image_t, Eigen::VectorXf>> ReadAllMixVprDescriptors()
+      const override {
+    using ReturnType = std::vector<std::pair<image_t, Eigen::VectorXf>>;
+    PYBIND11_OVERRIDE_PURE(ReturnType, Database, ReadAllMixVprDescriptors);
+  }
+
   FeatureMatchesBlob ReadMatchesBlob(image_t image_id1,
                                      image_t image_id2) const override {
     PYBIND11_OVERRIDE_PURE(
@@ -306,6 +325,12 @@ class PyDatabaseImpl : public Database, py::trampoline_self_life_support {
                         const FeatureDescriptors& descriptors) override {
     PYBIND11_OVERRIDE_PURE(
         void, Database, WriteDescriptors, image_id, descriptors);
+  }
+
+  void WriteMixVprDescriptor(image_t image_id,
+                             const Eigen::VectorXf& descriptor) override {
+    PYBIND11_OVERRIDE_PURE(
+        void, Database, WriteMixVprDescriptor, image_id, descriptor);
   }
 
   void WriteMatches(image_t image_id1,

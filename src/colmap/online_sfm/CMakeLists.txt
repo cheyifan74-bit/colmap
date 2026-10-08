@@ -7,7 +7,7 @@
 #     * Redistributions of source code must retain the above copyright
 #       notice, this list of conditions and the following disclaimer.
 #
-#     * Redistributions in binary form must reproduce the above copyright
+#     * Redistributions of binary form must reproduce the above copyright
 #       notice, this list of conditions and the following disclaimer in the
 #       documentation and/or other materials provided with the distribution.
 #
@@ -36,7 +36,9 @@ COLMAP_ADD_LIBRARY(
         online_feature_extractor.h online_feature_extractor.cc
         online_feature_matcher.h online_feature_matcher.cc
         online_incremental_mapper.h online_incremental_mapper.cc
+        online_loop_closer.h online_loop_closer.cc
         online_mapper.h online_mapper.cc
+        online_sim3_solver.h online_sim3_solver.cc
         timing_stats.h timing_stats.cc
     PUBLIC_LINK_LIBS
         colmap_sfm

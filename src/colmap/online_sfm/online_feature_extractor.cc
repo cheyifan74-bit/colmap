@@ -189,7 +189,9 @@ bool OnlineFeatureExtractor::ExtractAndWrite(
           camera = &cache.Camera(image.CameraId());
         }
       }
-    } catch (const std::exception&) {
+    } catch (const std::exception& e) {
+      LOG(WARNING) << "OnlineFeatureExtractor: failed to load camera for image "
+                   << image_id << ": " << e.what();
     }
   }
   if (camera != nullptr) {
@@ -213,6 +215,7 @@ bool OnlineFeatureExtractor::ExtractAndWrite(
   if (features != nullptr) {
     features->keypoints = keypoints;
     features->descriptors = descriptors;
+    features->bitmap = std::move(bitmap);
   }
 
   LOG(INFO) << "OnlineFeatureExtractor: extract image " << image_id << " -> "

@@ -646,6 +646,10 @@ class SqliteDatabase : public Database {
     return ExistsRowId(sql_stmt_exists_descriptors_, image_id);
   }
 
+  bool ExistsMixVprDescriptor(const image_t image_id) const override {
+    return ExistsRowId(sql_stmt_exists_mixvpr_descriptor_, image_id);
+  }
+
   bool ExistsMatches(const image_t image_id1,
                      const image_t image_id2) const override {
     return ExistsRowId(sql_stmt_exists_matches_,
@@ -682,6 +686,10 @@ class SqliteDatabase : public Database {
 
   size_t NumDescriptors() const override {
     return SumColumn("rows", "descriptors");
+  }
+
+  size_t NumMixVprDescriptors() const override {
+    return CountRows("mixvpr_descriptors");
   }
 
   size_t MaxNumDescriptors() const override {
@@ -920,6 +928,96 @@ class SqliteDatabase : public Database {
     }
 
     return descriptors;
+  }
+
+  Eigen::VectorXf ReadMixVprDescriptor(const image_t image_id) const override {
+    Sqlite3StmtContext context(sql_stmt_read_mixvpr_descriptor_);
+    SQLITE3_CALL(
+        sqlite3_bind_int64(sql_stmt_read_mixvpr_descriptor_, 1, image_id));
+    const int rc = SQLITE3_CALL(sqlite3_step(sql_stmt_read_mixvpr_descriptor_));
+    using Blob =
+        Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
+    const Blob blob =
+        ReadDynamicMatrixBlob<Blob>(sql_stmt_read_mixvpr_descriptor_, rc, 0);
+    if (blob.size() == 0) {
+      return {};
+    }
+    THROW_CHECK_EQ(blob.cols(), 1);
+    return Eigen::VectorXf(blob);
+  }
+
+  std::vector<std::pair<image_t, Eigen::VectorXf>> ReadAllMixVprDescriptors()
+      const override {
+    Sqlite3StmtContext context(sql_stmt_read_mixvpr_descriptors_all_);
+    std::vector<std::pair<image_t, Eigen::VectorXf>> results;
+    using Blob =
+        Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
+    while (SQLITE3_CALL(sqlite3_step(sql_stmt_read_mixvpr_descriptors_all_)) ==
+           SQLITE_ROW) {
+      const image_t image_id = static_cast<image_t>(
+          sqlite3_column_int64(sql_stmt_read_mixvpr_descriptors_all_, 0));
+      const Blob blob = ReadDynamicMatrixBlob<Blob>(
+          sql_stmt_read_mixvpr_descriptors_all_, SQLITE_ROW, 1);
+      if (blob.size() == 0 || blob.cols() != 1) {
+        continue;
+      }
+      results.emplace_back(image_id, Eigen::VectorXf(blob));
+    }
+    return results;
+  }
+
+  std::vector<std::pair<image_t, Eigen::VectorXf>> ReadMixVprDescriptors(
+      const std::vector<image_t>& image_ids) const override {
+    std::vector<std::pair<image_t, Eigen::VectorXf>> results;
+    if (image_ids.empty()) {
+      return results;
+    }
+    results.reserve(image_ids.size());
+    using Blob =
+        Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
+
+    // SQLite limits the number of bound variables per statement (999 for
+    // older versions, 32766 for newer). Query the ids in chunks below the
+    // limit so arbitrarily large id sets work.
+    const int max_vars =
+        sqlite3_limit(database_, SQLITE_LIMIT_VARIABLE_NUMBER, -1);
+    const size_t chunk_size = static_cast<size_t>(std::max(1, max_vars - 1));
+
+    for (size_t offset = 0; offset < image_ids.size(); offset += chunk_size) {
+      const size_t num_ids =
+          std::min(chunk_size, image_ids.size() - offset);
+
+      std::string placeholders = "?";
+      for (size_t i = 1; i < num_ids; ++i) {
+        placeholders += ",?";
+      }
+      const std::string sql =
+          "SELECT image_id, rows, cols, data FROM mixvpr_descriptors "
+          "WHERE image_id IN (" +
+          placeholders + ");";
+
+      sqlite3_stmt* sql_stmt = nullptr;
+      SQLITE3_CALL(sqlite3_prepare_v2(database_, sql.c_str(), -1, &sql_stmt, nullptr));
+      {
+        Sqlite3StmtContext context(sql_stmt);
+        for (size_t i = 0; i < num_ids; ++i) {
+          SQLITE3_CALL(sqlite3_bind_int64(
+              sql_stmt, static_cast<int>(i) + 1, image_ids[offset + i]));
+        }
+        // Rows come back in rowid order; the caller only needs id-desc pairs.
+        while (SQLITE3_CALL(sqlite3_step(sql_stmt)) == SQLITE_ROW) {
+          const image_t image_id =
+              static_cast<image_t>(sqlite3_column_int64(sql_stmt, 0));
+          const Blob blob = ReadDynamicMatrixBlob<Blob>(sql_stmt, SQLITE_ROW, 1);
+          if (blob.size() == 0 || blob.cols() != 1) {
+            continue;
+          }
+          results.emplace_back(image_id, Eigen::VectorXf(blob));
+        }
+      }
+      SQLITE3_CALL(sqlite3_finalize(sql_stmt));
+    }
+    return results;
   }
 
   FeatureMatchesBlob ReadMatchesBlob(image_t image_id1,
@@ -1362,6 +1460,18 @@ class SqliteDatabase : public Database {
     SQLITE3_CALL(sqlite3_step(sql_stmt_write_descriptors_));
   }
 
+  void WriteMixVprDescriptor(const image_t image_id,
+                             const Eigen::VectorXf& descriptor) override {
+    THROW_CHECK_GT(descriptor.size(), 0);
+    Sqlite3StmtContext context(sql_stmt_write_mixvpr_descriptor_);
+    SQLITE3_CALL(
+        sqlite3_bind_int64(sql_stmt_write_mixvpr_descriptor_, 1, image_id));
+    // Store as rows x 1 so WriteDynamicMatrixBlob matches keypoints layout.
+    const Eigen::MatrixXf blob = descriptor;
+    WriteDynamicMatrixBlob(sql_stmt_write_mixvpr_descriptor_, blob, 2);
+    SQLITE3_CALL(sqlite3_step(sql_stmt_write_mixvpr_descriptor_));
+  }
+
   void WriteMatches(const image_t image_id1,
                     const image_t image_id2,
                     const FeatureMatches& matches) override {
@@ -1775,6 +1885,8 @@ class SqliteDatabase : public Database {
                      &sql_stmt_exists_keypoints_);
     prepare_sql_stmt("SELECT 1 FROM descriptors WHERE image_id = ?;",
                      &sql_stmt_exists_descriptors_);
+    prepare_sql_stmt("SELECT 1 FROM mixvpr_descriptors WHERE image_id = ?;",
+                     &sql_stmt_exists_mixvpr_descriptor_);
     prepare_sql_stmt("SELECT 1 FROM matches WHERE pair_id = ?;",
                      &sql_stmt_exists_matches_);
     prepare_sql_stmt("SELECT 1 FROM two_view_geometries WHERE pair_id = ?;",
@@ -1884,6 +1996,12 @@ class SqliteDatabase : public Database {
         "SELECT rows, cols, data, type FROM descriptors WHERE "
         "image_id = ?;",
         &sql_stmt_read_descriptors_);
+    prepare_sql_stmt(
+        "SELECT rows, cols, data FROM mixvpr_descriptors WHERE image_id = ?;",
+        &sql_stmt_read_mixvpr_descriptor_);
+    prepare_sql_stmt(
+        "SELECT image_id, rows, cols, data FROM mixvpr_descriptors;",
+        &sql_stmt_read_mixvpr_descriptors_all_);
     prepare_sql_stmt("SELECT rows, cols, data FROM matches WHERE pair_id = ?;",
                      &sql_stmt_read_matches_);
     prepare_sql_stmt("SELECT * FROM matches WHERE rows > 0;",
@@ -1940,6 +2058,10 @@ class SqliteDatabase : public Database {
         "VALUES(?, ?, ?, ?, ?);",
         &sql_stmt_write_descriptors_);
     prepare_sql_stmt(
+        "INSERT OR REPLACE INTO mixvpr_descriptors(image_id, rows, cols, data) "
+        "VALUES(?, ?, ?, ?);",
+        &sql_stmt_write_mixvpr_descriptor_);
+    prepare_sql_stmt(
         "INSERT INTO matches(pair_id, rows, cols, data) VALUES(?, ?, "
         "?, ?);",
         &sql_stmt_write_matches_);
@@ -1995,6 +2117,7 @@ class SqliteDatabase : public Database {
     CreatePosePriorTable();
     CreateKeypointsTable();
     CreateDescriptorsTable();
+    CreateMixVprDescriptorsTable();
     CreateMatchesTable();
     CreateTwoViewGeometriesTable();
   }
@@ -2117,6 +2240,19 @@ class SqliteDatabase : public Database {
         "    rows          INTEGER               NOT NULL,"
         "    cols          INTEGER               NOT NULL,"
         "    data          BLOB,"
+        "    FOREIGN KEY(image_id) REFERENCES images(image_id) ON DELETE "
+        "CASCADE);";
+
+    SQLITE3_EXEC(database_, sql.c_str(), nullptr);
+  }
+
+  void CreateMixVprDescriptorsTable() const {
+    const std::string sql =
+        "CREATE TABLE IF NOT EXISTS mixvpr_descriptors"
+        "   (image_id  INTEGER  PRIMARY KEY  NOT NULL,"
+        "    rows      INTEGER               NOT NULL,"
+        "    cols      INTEGER               NOT NULL,"
+        "    data      BLOB,"
         "    FOREIGN KEY(image_id) REFERENCES images(image_id) ON DELETE "
         "CASCADE);";
 
@@ -2537,6 +2673,7 @@ class SqliteDatabase : public Database {
   sqlite3_stmt* sql_stmt_exists_pose_prior_ = nullptr;
   sqlite3_stmt* sql_stmt_exists_keypoints_ = nullptr;
   sqlite3_stmt* sql_stmt_exists_descriptors_ = nullptr;
+  sqlite3_stmt* sql_stmt_exists_mixvpr_descriptor_ = nullptr;
   sqlite3_stmt* sql_stmt_exists_matches_ = nullptr;
   sqlite3_stmt* sql_stmt_exists_two_view_geometry_ = nullptr;
 
@@ -2564,6 +2701,8 @@ class SqliteDatabase : public Database {
   sqlite3_stmt* sql_stmt_read_pose_priors_ = nullptr;
   sqlite3_stmt* sql_stmt_read_keypoints_ = nullptr;
   sqlite3_stmt* sql_stmt_read_descriptors_ = nullptr;
+  sqlite3_stmt* sql_stmt_read_mixvpr_descriptor_ = nullptr;
+  sqlite3_stmt* sql_stmt_read_mixvpr_descriptors_all_ = nullptr;
   sqlite3_stmt* sql_stmt_read_matches_ = nullptr;
   sqlite3_stmt* sql_stmt_read_matches_all_ = nullptr;
   sqlite3_stmt* sql_stmt_read_num_matches_ = nullptr;
@@ -2581,6 +2720,7 @@ class SqliteDatabase : public Database {
   sqlite3_stmt* sql_stmt_write_pose_prior_ = nullptr;
   sqlite3_stmt* sql_stmt_write_keypoints_ = nullptr;
   sqlite3_stmt* sql_stmt_write_descriptors_ = nullptr;
+  sqlite3_stmt* sql_stmt_write_mixvpr_descriptor_ = nullptr;
   sqlite3_stmt* sql_stmt_write_matches_ = nullptr;
   sqlite3_stmt* sql_stmt_write_two_view_geometry_ = nullptr;
 
