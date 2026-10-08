@@ -336,4 +336,18 @@ FeatureDescriptorsFloat LoadRandomDatabaseDescriptors(const Database& database,
   return result;
 }
 
+std::vector<std::pair<image_t, Eigen::VectorXf>>
+Database::ReadMixVprDescriptors(const std::vector<image_t>& image_ids) const {
+  std::vector<std::pair<image_t, Eigen::VectorXf>> results;
+  results.reserve(image_ids.size());
+  for (const image_t image_id : image_ids) {
+    Eigen::VectorXf descriptor = ReadMixVprDescriptor(image_id);
+    if (descriptor.size() == 0) {
+      continue;
+    }
+    results.emplace_back(image_id, std::move(descriptor));
+  }
+  return results;
+}
+
 }  // namespace colmap

@@ -435,6 +435,7 @@ set(COLMAP_EXPORT_LIBS
     colmap_scene_types
     colmap_sensor
     colmap_sfm
+    colmap_online_sfm
     colmap_util
     # Third-party.
     colmap_vlfeat

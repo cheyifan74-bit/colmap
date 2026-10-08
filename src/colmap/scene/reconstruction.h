@@ -108,7 +108,8 @@ class Reconstruction {
   bool IsValid() const;
 
   // Load data from given `DatabaseCache`.
-  void Load(const DatabaseCache& database_cache);
+  // Returns the identifiers of images newly added to this reconstruction.
+  std::vector<image_t> Load(const DatabaseCache& database_cache);
 
   // Finalize the Reconstruction after the reconstruction has finished.
   // Once a scene has been finalized, it cannot be used for reconstruction.

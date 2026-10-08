@@ -115,25 +115,12 @@ void ObservationManager::AddImage(const image_t image_id) {
     // the cached stats for existing images, whose observation/correspondence
     // counts may have increased when AddTwoViewGeometry added new
     // correspondences.
-    for (auto& [other_image_id, other_stats] : image_stats_) {
+    for (const auto& [other_image_id, other_stats] : image_stats_) {
+      (void)other_stats;
       if (other_image_id == image_id) {
         continue;
       }
-      const point2D_t num_matches =
-          correspondence_graph_->NumMatchesBetweenImages(image_id,
-                                                         other_image_id);
-      if (num_matches > 0) {
-        const image_pair_t pair_id =
-            ImagePairToPairId(image_id, other_image_id);
-        ImagePairStat image_pair_stat;
-        image_pair_stat.num_total_corrs = num_matches;
-        image_pair_stats_.emplace(pair_id, image_pair_stat);
-
-        other_stats.num_observations =
-            correspondence_graph_->NumObservationsForImage(other_image_id);
-        other_stats.num_correspondences =
-            correspondence_graph_->NumCorrespondencesForImage(other_image_id);
-      }
+      AddImagePair(image_id, other_image_id);
     }
 
     // Propagate visibility from already-triangulated points.
@@ -176,6 +163,40 @@ ObservationManager::ImageStat ObservationManager::InitImageStat(
         correspondence_graph_->NumCorrespondencesForImage(image_id);
   }
   return image_stat;
+}
+
+void ObservationManager::AddImagePair(const image_t image_id1,
+                                      const image_t image_id2) {
+  if (correspondence_graph_ == nullptr || image_id1 == image_id2) {
+    return;
+  }
+  if (image_stats_.find(image_id1) == image_stats_.end() ||
+      image_stats_.find(image_id2) == image_stats_.end()) {
+    return;
+  }
+  const point2D_t num_matches =
+      correspondence_graph_->NumMatchesBetweenImages(image_id1, image_id2);
+  if (num_matches == 0) {
+    return;
+  }
+
+  const image_pair_t pair_id = ImagePairToPairId(image_id1, image_id2);
+  ImagePairStat& pair_stats = image_pair_stats_[pair_id];
+  if (pair_stats.num_total_corrs < static_cast<size_t>(num_matches)) {
+    pair_stats.num_total_corrs = num_matches;
+  }
+
+  ImageStat& stats1 = image_stats_.at(image_id1);
+  stats1.num_observations =
+      correspondence_graph_->NumObservationsForImage(image_id1);
+  stats1.num_correspondences =
+      correspondence_graph_->NumCorrespondencesForImage(image_id1);
+
+  ImageStat& stats2 = image_stats_.at(image_id2);
+  stats2.num_observations =
+      correspondence_graph_->NumObservationsForImage(image_id2);
+  stats2.num_correspondences =
+      correspondence_graph_->NumCorrespondencesForImage(image_id2);
 }
 
 void ObservationManager::IncrementCorrespondenceHasPoint3D(
@@ -238,6 +259,14 @@ void ObservationManager::SetObservationAsTriangulated(
         (is_continued_point3D || image_id < corr->image_id)) {
       const image_pair_t pair_id = ImagePairToPairId(image_id, corr->image_id);
       auto& stats = image_pair_stats_[pair_id];
+      // Online SfM may add correspondences after both images were already
+      // registered. Pair stats would then default-construct with
+      // num_total_corrs=0 and abort on the first triangulated track.
+      if (stats.num_total_corrs == 0) {
+        stats.num_total_corrs =
+            correspondence_graph_->NumMatchesBetweenImages(image_id,
+                                                           corr->image_id);
+      }
       stats.num_tri_corrs += 1;
       THROW_CHECK_LE(stats.num_tri_corrs, stats.num_total_corrs)
           << "The correspondence graph must not contain duplicate matches: "

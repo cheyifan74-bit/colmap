@@ -52,7 +52,14 @@ unset(onnxruntime_FOUND)
 unset(onnxruntime_INCLUDE_DIRS)
 unset(onnxruntime_LIBRARIES)
 
-find_package(onnxruntime CONFIG QUIET PATHS ${onnxruntime_CONFIG_DIR_HINTS})
+if(onnxruntime_CONFIG_DIR_HINTS)
+    find_package(onnxruntime CONFIG QUIET
+                 PATHS ${onnxruntime_CONFIG_DIR_HINTS}
+                 NO_DEFAULT_PATH)
+endif()
+if(NOT TARGET onnxruntime::onnxruntime)
+    find_package(onnxruntime CONFIG QUIET PATHS ${onnxruntime_CONFIG_DIR_HINTS})
+endif()
 if(TARGET onnxruntime::onnxruntime)
     set(onnxruntime_FOUND TRUE)
     message(STATUS "Found onnxruntime")
