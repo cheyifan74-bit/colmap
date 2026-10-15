@@ -70,6 +70,9 @@ constexpr size_t kMaxLoopMapImages = 10;
 // A corrected frame joins the fusion / loop-BA window when at least this many
 // loop-side map points project inside it.
 constexpr size_t kMinOverlapProjections = 50;
+// Newest track observations used as fusion descriptor references. The minimum
+// L2 among them is kept, same as local-map projection matching.
+constexpr size_t kMaxFuseRefDescriptors = 3;
 
 std::string ScoreForFilename(const float score) {
   std::ostringstream oss;
@@ -1333,6 +1336,222 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
   return true;
 }
 
+point3D_t ResolveMergedPoint(
+    const std::unordered_map<point3D_t, point3D_t>& remap, point3D_t id) {
+  while (true) {
+    const auto it = remap.find(id);
+    if (it == remap.end()) {
+      return id;
+    }
+    id = it->second;
+  }
+}
+
+bool MergeKeepLoopPoint(ObservationManager* obs_manager,
+                        Reconstruction& reconstruction,
+                        std::unordered_map<point3D_t, point3D_t>* remap,
+                        const point3D_t cur_pid,
+                        const point3D_t loop_pid) {
+  const Eigen::Vector3d loop_xyz = reconstruction.Point3D(loop_pid).xyz;
+  try {
+    const point3D_t merged = obs_manager->MergePoints3D(cur_pid, loop_pid);
+    reconstruction.Point3D(merged).xyz = loop_xyz;
+    (*remap)[cur_pid] = merged;
+    (*remap)[loop_pid] = merged;
+    return true;
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "OnlineLoopCloser: merge " << cur_pid << "+" << loop_pid
+                 << " failed: " << e.what();
+    return false;
+  }
+}
+
+bool AttachLoopObservation(ObservationManager* obs_manager,
+                           const point3D_t loop_pid,
+                           const image_t image_id,
+                           const point2D_t idx) {
+  try {
+    obs_manager->AddObservation(loop_pid, TrackElement(image_id, idx));
+    return true;
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "OnlineLoopCloser: attach point " << loop_pid
+                 << " to image " << image_id << " failed: " << e.what();
+    return false;
+  }
+}
+
+struct ProjectionFuseStats {
+  size_t num_fused = 0;
+  size_t num_attached = 0;
+  size_t num_rejected_dist = 0;
+  size_t num_rejected_desc = 0;
+};
+
+// Project loop-side points into `image_ids` and merge or attach descriptor
+// matches inside the fuse radius.
+ProjectionFuseStats FuseLoopMapByProjection(
+    const std::string& database_path,
+    const OnlineLoopCloserOptions& options,
+    Reconstruction& reconstruction,
+    ObservationManager* obs_manager,
+    const std::unordered_set<point3D_t>& loop_point_ids,
+    const std::vector<image_t>& image_ids,
+    std::unordered_map<point3D_t, point3D_t>* remap) {
+  ProjectionFuseStats stats;
+  if (obs_manager == nullptr || image_ids.empty() || loop_point_ids.empty()) {
+    return stats;
+  }
+
+  std::unordered_map<image_t, FeatureDescriptors> descriptors;
+  std::unordered_map<point3D_t, std::vector<TrackElement>> loop_refs;
+  try {
+    DatabaseSession session(database_path);
+    const auto Load = [&](const image_t id) {
+      if (descriptors.count(id) == 0 && session->ExistsDescriptors(id)) {
+        descriptors.emplace(id, session->ReadDescriptors(id));
+      }
+    };
+    for (const image_t id : image_ids) {
+      Load(id);
+    }
+    std::vector<TrackElement> track_elements;
+    for (const point3D_t point3D_id_raw : loop_point_ids) {
+      const point3D_t point3D_id = ResolveMergedPoint(*remap, point3D_id_raw);
+      if (!reconstruction.ExistsPoint3D(point3D_id) ||
+          loop_refs.count(point3D_id_raw) > 0) {
+        continue;
+      }
+      track_elements = reconstruction.Point3D(point3D_id).track.Elements();
+      std::sort(track_elements.begin(),
+                track_elements.end(),
+                [](const TrackElement& a, const TrackElement& b) {
+                  return a.image_id > b.image_id;
+                });
+      std::vector<TrackElement> refs;
+      for (const TrackElement& el : track_elements) {
+        if (refs.size() >= kMaxFuseRefDescriptors) {
+          break;
+        }
+        if (!reconstruction.ExistsImage(el.image_id) ||
+            !reconstruction.Image(el.image_id).HasPose()) {
+          continue;
+        }
+        Load(el.image_id);
+        const auto ref_it = descriptors.find(el.image_id);
+        if (ref_it == descriptors.end() ||
+            static_cast<int>(el.point2D_idx) >= ref_it->second.data.rows()) {
+          continue;
+        }
+        refs.push_back(el);
+      }
+      if (!refs.empty()) {
+        loop_refs.emplace(point3D_id_raw, std::move(refs));
+      }
+    }
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "OnlineLoopCloser: failed to read fusion descriptors: "
+                 << e.what();
+    return stats;
+  }
+
+  const double fuse_radius_sq = options.fuse_radius_px * options.fuse_radius_px;
+  for (const image_t id : image_ids) {
+    if (!reconstruction.ExistsImage(id)) {
+      continue;
+    }
+    Image& image = reconstruction.Image(id);
+    const auto desc_it = descriptors.find(id);
+    if (!image.HasPose() || !image.HasCameraPtr() ||
+        desc_it == descriptors.end()) {
+      continue;
+    }
+    const Camera& camera = *image.CameraPtr();
+    const Rigid3d cam_from_world = image.CamFromWorld();
+    const double cell = std::max(1.0, options.fuse_radius_px);
+    const int grid_w = static_cast<int>(camera.width / cell) + 1;
+    const int grid_h = static_cast<int>(camera.height / cell) + 1;
+    std::vector<std::vector<point2D_t>> grid(grid_w * grid_h);
+    for (point2D_t i = 0; i < image.NumPoints2D(); ++i) {
+      const Eigen::Vector2d& xy = image.Point2D(i).xy;
+      const int gx = std::clamp(static_cast<int>(xy.x() / cell), 0, grid_w - 1);
+      const int gy = std::clamp(static_cast<int>(xy.y() / cell), 0, grid_h - 1);
+      grid[gy * grid_w + gx].push_back(i);
+    }
+    std::unordered_set<point2D_t> used;
+    for (const auto& [loop_pid_raw, refs] : loop_refs) {
+      const point3D_t loop_pid = ResolveMergedPoint(*remap, loop_pid_raw);
+      if (!reconstruction.ExistsPoint3D(loop_pid) ||
+          image.HasPoint3D(loop_pid) || refs.empty()) {
+        continue;
+      }
+      const Eigen::Vector3d loop_xyz = reconstruction.Point3D(loop_pid).xyz;
+      const auto proj = ProjectCam(camera, cam_from_world * loop_xyz);
+      if (!proj || !InsideImage(camera, *proj)) {
+        continue;
+      }
+      float best_l2 = kLoopDescMaxL2Sq;
+      point2D_t best_idx = kInvalidPoint2DIdx;
+      bool any_in_radius = false;
+      const int pgx = static_cast<int>(proj->x() / cell);
+      const int pgy = static_cast<int>(proj->y() / cell);
+      for (int gy = std::max(0, pgy - 1); gy <= std::min(grid_h - 1, pgy + 1);
+           ++gy) {
+        for (int gx = std::max(0, pgx - 1); gx <= std::min(grid_w - 1, pgx + 1);
+             ++gx) {
+          for (const point2D_t i : grid[gy * grid_w + gx]) {
+            if (used.count(i) > 0 ||
+                (image.Point2D(i).xy - *proj).squaredNorm() >= fuse_radius_sq) {
+              continue;
+            }
+            any_in_radius = true;
+            float l2 = std::numeric_limits<float>::infinity();
+            for (const TrackElement& ref : refs) {
+              const auto ref_desc_it = descriptors.find(ref.image_id);
+              if (ref_desc_it == descriptors.end()) {
+                continue;
+              }
+              l2 = std::min(l2,
+                            DescriptorL2Sq(ref_desc_it->second,
+                                           ref.point2D_idx,
+                                           desc_it->second,
+                                           i));
+            }
+            if (l2 < best_l2) {
+              best_l2 = l2;
+              best_idx = i;
+            }
+          }
+        }
+      }
+      if (best_idx == kInvalidPoint2DIdx) {
+        stats.num_rejected_desc += any_in_radius ? 1 : 0;
+        continue;
+      }
+      const Point2D& point2D = image.Point2D(best_idx);
+      if (point2D.HasPoint3D()) {
+        const point3D_t cur_pid = point2D.point3D_id;
+        if (cur_pid == loop_pid || !reconstruction.ExistsPoint3D(cur_pid)) {
+          continue;
+        }
+        if ((reconstruction.Point3D(cur_pid).xyz - loop_xyz).norm() >
+            options.fuse_max_point_distance) {
+          ++stats.num_rejected_dist;
+          continue;
+        }
+        if (MergeKeepLoopPoint(
+                obs_manager, reconstruction, remap, cur_pid, loop_pid)) {
+          used.insert(best_idx);
+          ++stats.num_fused;
+        }
+      } else if (AttachLoopObservation(obs_manager, loop_pid, id, best_idx)) {
+        used.insert(best_idx);
+        ++stats.num_attached;
+      }
+    }
+  }
+  return stats;
+}
+
 bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
                                    ObservationManager* obs_manager,
                                    const OnlineLoopPair& loop_pair) {
@@ -1497,18 +1716,18 @@ bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
     }
   }
 
-  // Loop-side map points with one reference observation each (descriptor).
-  std::unordered_map<point3D_t, std::pair<image_t, point2D_t>> loop_points;
+  // Loop-side map points. Descriptor references are chosen later from the
+  // newest observations on each track.
+  std::unordered_set<point3D_t> loop_point_ids;
   for (const image_t id : anchor_set) {
     if (!reconstruction.ExistsImage(id)) {
       continue;
     }
     const Image& image = reconstruction.Image(id);
-    for (point2D_t idx = 0; idx < image.NumPoints2D(); ++idx) {
-      const Point2D& point2D = image.Point2D(idx);
+    for (const Point2D& point2D : image.Points2D()) {
       if (point2D.HasPoint3D() &&
           reconstruction.ExistsPoint3D(point2D.point3D_id)) {
-        loop_points.emplace(point2D.point3D_id, std::make_pair(id, idx));
+        loop_point_ids.insert(point2D.point3D_id);
       }
     }
   }
@@ -1524,7 +1743,7 @@ bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
     const Camera& camera = *image.CameraPtr();
     const Rigid3d cam_from_world = image.CamFromWorld();
     size_t num_visible = 0;
-    for (const auto& [loop_pid, ref] : loop_points) {
+    for (const point3D_t loop_pid : loop_point_ids) {
       const auto proj = ProjectCam(
           camera, cam_from_world * reconstruction.Point3D(loop_pid).xyz);
       if (proj && InsideImage(camera, *proj)) {
@@ -1532,7 +1751,7 @@ bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
       }
     }
     if (id == current_id || num_visible >= kMinOverlapProjections) {
-      overlap.emplace_back(id == current_id ? loop_points.size() + 1
+      overlap.emplace_back(id == current_id ? loop_point_ids.size() + 1
                                             : num_visible,
                            id);
     }
@@ -1547,63 +1766,7 @@ bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
     connected.push_back(id);
   }
 
-  std::unordered_map<image_t, FeatureDescriptors> descriptors;
-  try {
-    DatabaseSession session(database_path_);
-    const auto Load = [&](const image_t id) {
-      if (descriptors.count(id) == 0 && session->ExistsDescriptors(id)) {
-        descriptors.emplace(id, session->ReadDescriptors(id));
-      }
-    };
-    for (const image_t id : anchor_set) {
-      Load(id);
-    }
-    for (const image_t id : connected) {
-      Load(id);
-    }
-  } catch (const std::exception& e) {
-    LOG(WARNING) << "OnlineLoopCloser: CorrectLoop failed to read descriptors: "
-                 << e.what();
-  }
-
   std::unordered_map<point3D_t, point3D_t> remap;
-  const auto Resolve = [&](point3D_t id) {
-    while (true) {
-      const auto it = remap.find(id);
-      if (it == remap.end()) {
-        return id;
-      }
-      id = it->second;
-    }
-  };
-  // Merge into the loop-side point and keep its (old map) position.
-  const auto MergeKeepLoop = [&](const point3D_t cur_pid,
-                                 const point3D_t loop_pid) {
-    const Eigen::Vector3d loop_xyz = reconstruction.Point3D(loop_pid).xyz;
-    try {
-      const point3D_t merged = obs_manager->MergePoints3D(cur_pid, loop_pid);
-      reconstruction.Point3D(merged).xyz = loop_xyz;
-      remap[cur_pid] = merged;
-      remap[loop_pid] = merged;
-      return true;
-    } catch (const std::exception& e) {
-      LOG(WARNING) << "OnlineLoopCloser: merge " << cur_pid << "+" << loop_pid
-                   << " failed: " << e.what();
-      return false;
-    }
-  };
-  const auto Attach = [&](const point3D_t loop_pid,
-                          const image_t image_id,
-                          const point2D_t idx) {
-    try {
-      obs_manager->AddObservation(loop_pid, TrackElement(image_id, idx));
-      return true;
-    } catch (const std::exception& e) {
-      LOG(WARNING) << "OnlineLoopCloser: attach point " << loop_pid
-                   << " to image " << image_id << " failed: " << e.what();
-      return false;
-    }
-  };
 
   // Stage C1: PnP inliers of the current frame.
   size_t num_fused_direct = 0;
@@ -1611,7 +1774,7 @@ bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
   {
     const Image& current = reconstruction.Image(current_id);
     for (const auto& [idx, loop_pid_raw] : loop_pair.loop_observations) {
-      const point3D_t loop_pid = Resolve(loop_pid_raw);
+      const point3D_t loop_pid = ResolveMergedPoint(remap, loop_pid_raw);
       if (idx >= current.NumPoints2D() ||
           !reconstruction.ExistsPoint3D(loop_pid)) {
         continue;
@@ -1619,112 +1782,42 @@ bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
       const Point2D& point2D = current.Point2D(idx);
       if (point2D.HasPoint3D()) {
         if (point2D.point3D_id != loop_pid &&
-            MergeKeepLoop(point2D.point3D_id, loop_pid)) {
+            MergeKeepLoopPoint(obs_manager,
+                               reconstruction,
+                               &remap,
+                               point2D.point3D_id,
+                               loop_pid)) {
           ++num_fused_direct;
         }
       } else if (!current.HasPoint3D(loop_pid) &&
-                 Attach(loop_pid, current_id, idx)) {
+                 AttachLoopObservation(obs_manager, loop_pid, current_id, idx)) {
         ++num_attached_direct;
       }
     }
   }
 
-  // Stage C2: project the loop-side map into the overlap window; accept the
-  // descriptor-closest keypoint inside the fuse radius.
-  const double fuse_radius_sq =
-      options_.fuse_radius_px * options_.fuse_radius_px;
-  size_t num_fused_proj = 0;
-  size_t num_attached_proj = 0;
-  size_t num_rejected_dist = 0;
-  size_t num_rejected_desc = 0;
-  for (const image_t id : connected) {
-    Image& image = reconstruction.Image(id);
-    const auto desc_it = descriptors.find(id);
-    if (!image.HasPose() || !image.HasCameraPtr() ||
-        desc_it == descriptors.end()) {
-      continue;
-    }
-    const Camera& camera = *image.CameraPtr();
-    const Rigid3d cam_from_world = image.CamFromWorld();
-    const double cell = std::max(1.0, options_.fuse_radius_px);
-    const int grid_w = static_cast<int>(camera.width / cell) + 1;
-    const int grid_h = static_cast<int>(camera.height / cell) + 1;
-    std::vector<std::vector<point2D_t>> grid(grid_w * grid_h);
-    for (point2D_t i = 0; i < image.NumPoints2D(); ++i) {
-      const Eigen::Vector2d& xy = image.Point2D(i).xy;
-      const int gx = std::clamp(static_cast<int>(xy.x() / cell), 0, grid_w - 1);
-      const int gy = std::clamp(static_cast<int>(xy.y() / cell), 0, grid_h - 1);
-      grid[gy * grid_w + gx].push_back(i);
-    }
-    std::unordered_set<point2D_t> used;
-    for (const auto& [loop_pid_raw, ref] : loop_points) {
-      const point3D_t loop_pid = Resolve(loop_pid_raw);
-      const auto ref_desc_it = descriptors.find(ref.first);
-      if (!reconstruction.ExistsPoint3D(loop_pid) ||
-          image.HasPoint3D(loop_pid) || ref_desc_it == descriptors.end()) {
-        continue;
-      }
-      const Eigen::Vector3d loop_xyz = reconstruction.Point3D(loop_pid).xyz;
-      const auto proj = ProjectCam(camera, cam_from_world * loop_xyz);
-      if (!proj || !InsideImage(camera, *proj)) {
-        continue;
-      }
-      float best_l2 = kLoopDescMaxL2Sq;
-      point2D_t best_idx = kInvalidPoint2DIdx;
-      bool any_in_radius = false;
-      const int pgx = static_cast<int>(proj->x() / cell);
-      const int pgy = static_cast<int>(proj->y() / cell);
-      for (int gy = std::max(0, pgy - 1); gy <= std::min(grid_h - 1, pgy + 1);
-           ++gy) {
-        for (int gx = std::max(0, pgx - 1); gx <= std::min(grid_w - 1, pgx + 1);
-             ++gx) {
-          for (const point2D_t i : grid[gy * grid_w + gx]) {
-            if (used.count(i) > 0 ||
-                (image.Point2D(i).xy - *proj).squaredNorm() >= fuse_radius_sq) {
-              continue;
-            }
-            any_in_radius = true;
-            const float l2 = DescriptorL2Sq(
-                ref_desc_it->second, ref.second, desc_it->second, i);
-            if (l2 < best_l2) {
-              best_l2 = l2;
-              best_idx = i;
-            }
-          }
-        }
-      }
-      if (best_idx == kInvalidPoint2DIdx) {
-        num_rejected_desc += any_in_radius ? 1 : 0;
-        continue;
-      }
-      const Point2D& point2D = image.Point2D(best_idx);
-      if (point2D.HasPoint3D()) {
-        const point3D_t cur_pid = point2D.point3D_id;
-        if (cur_pid == loop_pid || !reconstruction.ExistsPoint3D(cur_pid)) {
-          continue;
-        }
-        if ((reconstruction.Point3D(cur_pid).xyz - loop_xyz).norm() >
-            options_.fuse_max_point_distance) {
-          ++num_rejected_dist;
-          continue;
-        }
-        if (MergeKeepLoop(cur_pid, loop_pid)) {
-          used.insert(best_idx);
-          ++num_fused_proj;
-        }
-      } else if (Attach(loop_pid, id, best_idx)) {
-        used.insert(best_idx);
-        ++num_attached_proj;
-      }
-    }
-  }
+  // Stage C2: project the loop-side map into the overlap window.
+  const ProjectionFuseStats proj = FuseLoopMapByProjection(database_path_,
+                                                           options_,
+                                                           reconstruction,
+                                                           obs_manager,
+                                                           loop_point_ids,
+                                                           connected,
+                                                           &remap);
+  const size_t num_fused_proj = proj.num_fused;
+  const size_t num_attached_proj = proj.num_attached;
+  const size_t num_rejected_dist = proj.num_rejected_dist;
+  const size_t num_rejected_desc = proj.num_rejected_desc;
 
   last_correction_.current_id = current_id;
   last_correction_.loop_id = loop_id;
   // Every pose-graph-moved frame is refined and filtered; `connected` only
-  // limits fusion.
+  // limits fusion. The same window is projected again after loop BA.
   last_correction_.variable_ids = variable_ids;
   last_correction_.anchor_ids = loop_map_ids;
+  last_correction_.fusion_ids = connected;
+  last_correction_.loop_point_image_ids.assign(anchor_set.begin(),
+                                               anchor_set.end());
 
   LOG(INFO) << "OnlineLoopCloser: CorrectLoop " << current_id << "-" << loop_id
             << " variable=[" << variable_ids.front() << ".."
@@ -1749,6 +1842,45 @@ bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
             << *std::min_element(connected.begin(), connected.end()) << ".."
             << *std::max_element(connected.begin(), connected.end()) << "]";
   return num_poses_corrected > 0;
+}
+
+void OnlineLoopCloser::FuseAfterLoopBA(Reconstruction& reconstruction,
+                                       ObservationManager* obs_manager) {
+  if (obs_manager == nullptr || last_correction_.fusion_ids.empty() ||
+      last_correction_.loop_point_image_ids.empty()) {
+    return;
+  }
+
+  std::unordered_set<point3D_t> loop_point_ids;
+  for (const image_t id : last_correction_.loop_point_image_ids) {
+    if (!reconstruction.ExistsImage(id)) {
+      continue;
+    }
+    for (const Point2D& point2D : reconstruction.Image(id).Points2D()) {
+      if (point2D.HasPoint3D() &&
+          reconstruction.ExistsPoint3D(point2D.point3D_id)) {
+        loop_point_ids.insert(point2D.point3D_id);
+      }
+    }
+  }
+
+  std::unordered_map<point3D_t, point3D_t> remap;
+  const ProjectionFuseStats proj =
+      FuseLoopMapByProjection(database_path_,
+                              options_,
+                              reconstruction,
+                              obs_manager,
+                              loop_point_ids,
+                              last_correction_.fusion_ids,
+                              &remap);
+  LOG(INFO) << "OnlineLoopCloser: post-BA fuse " << last_correction_.current_id
+            << "-" << last_correction_.loop_id
+            << " window=" << last_correction_.fusion_ids.size()
+            << " points=" << loop_point_ids.size()
+            << " fuse_proj=" << proj.num_fused
+            << " attach_proj=" << proj.num_attached
+            << " fuse_rejected_dist=" << proj.num_rejected_dist
+            << " fuse_rejected_desc=" << proj.num_rejected_desc;
 }
 
 std::vector<image_t> OnlineLoopCloser::LoopMapImages(

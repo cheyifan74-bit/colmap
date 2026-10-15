@@ -271,6 +271,8 @@ bool OnlineIncrementalMapper::Process(
     if (corrected) {
       const OnlineLoopCorrection& correction = loop_closer_->LastCorrection();
       mapper_->AdjustLoopBundle(correction.variable_ids, correction.anchor_ids);
+      loop_closer_->FuseAfterLoopBA(mapper_->GetReconstruction(),
+                                    mapper_->GetObservationManager());
       mapper_->WriteSparse();
     }
   }

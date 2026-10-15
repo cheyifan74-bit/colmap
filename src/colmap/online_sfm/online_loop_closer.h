@@ -119,6 +119,10 @@ struct OnlineLoopCorrection {
   image_t loop_id = kInvalidImageId;
   std::vector<image_t> variable_ids;
   std::vector<image_t> anchor_ids;
+  // Frames the loop-side map was projected into. Post-BA fusion reuses them.
+  std::vector<image_t> fusion_ids;
+  // Images whose 3D points are the loop-side map for that projection.
+  std::vector<image_t> loop_point_image_ids;
 };
 
 class MixVprEncoder;
@@ -148,6 +152,11 @@ class OnlineLoopCloser {
   const OnlineLoopCorrection& LastCorrection() const {
     return last_correction_;
   }
+
+  // Project the loop-side map into the fusion window again, after loop BA has
+  // moved poses and points, and merge pairs now within the fuse distance.
+  void FuseAfterLoopBA(Reconstruction& reconstruction,
+                       ObservationManager* obs_manager);
 
  private:
   bool InitMixVprModel();
