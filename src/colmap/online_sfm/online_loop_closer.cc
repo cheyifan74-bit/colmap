@@ -32,8 +32,11 @@
 
 #include "colmap/feature/types.h"
 #include "colmap/geometry/rigid3.h"
-#include "colmap/geometry/sim3.h"
-#include "colmap/online_sfm/online_sim3_solver.h"
+#include "colmap/estimators/pose.h"
+#include "colmap/geometry/essential_matrix.h"
+#include "colmap/math/math.h"
+#include "colmap/online_sfm/online_pose_graph.h"
+#include "colmap/scene/projection.h"
 #include "colmap/online_sfm/timing_stats.h"
 #include "colmap/scene/camera.h"
 #include "colmap/scene/database_session.h"
@@ -47,6 +50,7 @@
 #include <cmath>
 #include <exception>
 #include <filesystem>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <numeric>
@@ -58,6 +62,14 @@
 
 namespace colmap {
 namespace {
+
+// Loop edge vs odometry edges in the pose graph (residual scale).
+constexpr double kLoopEdgeWeight = 10.0;
+// Candidate + covisibles used as the loop-side map for PnP and fusion.
+constexpr size_t kMaxLoopMapImages = 10;
+// A corrected frame joins the fusion / loop-BA window when at least this many
+// loop-side map points project inside it.
+constexpr size_t kMinOverlapProjections = 50;
 
 std::string ScoreForFilename(const float score) {
   std::ostringstream oss;
@@ -137,23 +149,14 @@ bool GeometryUsable(const TwoViewGeometry& geometry, const int min_inliers) {
          geometry.inlier_matches.size() >= static_cast<size_t>(min_inliers);
 }
 
-Sim3d ToSim3(const Rigid3d& rigid) {
-  return Sim3d(1.0, rigid.rotation(), rigid.translation());
-}
+// SIFT descriptors are L2-normalized to 512.
+constexpr float kLoopDescMaxL2Sq = 512.0f * 512.0f * 0.7f * 0.7f;
 
-struct LoopSim3Corr {
-  Eigen::Vector3d xyz_cam_current = Eigen::Vector3d::Zero();
-  Eigen::Vector3d xyz_cam_candidate = Eigen::Vector3d::Zero();
-  Eigen::Vector3d xyz_cam_other = Eigen::Vector3d::Zero();
-  Eigen::Vector2d xy_current = Eigen::Vector2d::Zero();
-  Eigen::Vector2d xy_other = Eigen::Vector2d::Zero();
-  Sim3d other_from_cand;
-  const Camera* cam_other = nullptr;
-  image_t other_id = kInvalidImageId;
+// Current keypoint ↔ loop-side map point.
+struct LoopPnPCorr {
   point2D_t idx_current = kInvalidPoint2DIdx;
-  point2D_t idx_other = kInvalidPoint2DIdx;
-  point3D_t current_point3D_id = kInvalidPoint3DId;
-  point3D_t other_point3D_id = kInvalidPoint3DId;
+  point3D_t point3D_id = kInvalidPoint3DId;
+  Eigen::Vector2d xy_current = Eigen::Vector2d::Zero();
 };
 
 std::optional<Eigen::Vector2d> ProjectCam(const Camera& camera,
@@ -164,46 +167,19 @@ std::optional<Eigen::Vector2d> ProjectCam(const Camera& camera,
   return camera.ImgFromCam(xyz_cam);
 }
 
+bool InsideImage(const Camera& camera, const Eigen::Vector2d& xy) {
+  return xy.x() >= 0.0 && xy.y() >= 0.0 &&
+         xy.x() < static_cast<double>(camera.width) &&
+         xy.y() < static_cast<double>(camera.height);
+}
+
 size_t CountInliers(const std::vector<char>& inliers) {
   return static_cast<size_t>(std::count(inliers.begin(), inliers.end(), 1));
 }
 
-std::vector<OnlineSim3Correspondence> ToOnlineSim3Corrs(
-    const std::vector<LoopSim3Corr>& corrs,
-    const image_t candidate_id,
-    const Camera& cam_candidate) {
-  std::vector<OnlineSim3Correspondence> out;
-  out.reserve(corrs.size());
-  for (const LoopSim3Corr& corr : corrs) {
-    OnlineSim3Correspondence o;
-    o.xyz_cam_current = corr.xyz_cam_current;
-    o.xyz_cam_candidate = corr.xyz_cam_candidate;
-    o.xy_current = corr.xy_current;
-    if (corr.other_id == candidate_id) {
-      o.xy_candidate = corr.xy_other;
-    } else if (const auto proj =
-                   ProjectCam(cam_candidate, corr.xyz_cam_candidate)) {
-      o.xy_candidate = *proj;
-    } else {
-      o.xy_candidate = corr.xy_other;
-    }
-    out.push_back(o);
-  }
-  return out;
-}
-
-std::vector<char> ComputeReprojInliers(const Sim3d& cand_from_cur,
-                                       const Camera& cam_current,
-                                       const Camera& cam_candidate,
-                                       const image_t candidate_id,
-                                       const std::vector<LoopSim3Corr>& corrs,
-                                       const double max_reproj_px) {
-  return ComputeSim3ReprojInliers(
-      cand_from_cur,
-      cam_current,
-      cam_candidate,
-      ToOnlineSim3Corrs(corrs, candidate_id, cam_candidate),
-      max_reproj_px);
+double RotationDiffDeg(const Eigen::Quaterniond& a,
+                       const Eigen::Quaterniond& b) {
+  return RadToDeg(Eigen::AngleAxisd(a * b.inverse()).angle());
 }
 
 float DescriptorL2Sq(const FeatureDescriptors& a,
@@ -219,332 +195,178 @@ float DescriptorL2Sq(const FeatureDescriptors& a,
       (a.data.row(ia).cast<int>() - b.data.row(ib).cast<int>()).squaredNorm());
 }
 
-bool FindNearestTriangulated(const Image& image,
-                             const Reconstruction& reconstruction,
-                             const Eigen::Vector2d& xy,
-                             const double radius_sq,
-                             const std::unordered_set<point2D_t>& used,
-                             const point3D_t skip_point3D,
-                             point2D_t* best_idx) {
-  double best = radius_sq;
-  bool found = false;
-  for (point2D_t i = 0; i < image.NumPoints2D(); ++i) {
-    if (used.count(i) > 0) {
-      continue;
-    }
-    const Point2D& point2D = image.Point2D(i);
-    if (!point2D.HasPoint3D() || point2D.point3D_id == skip_point3D ||
-        !reconstruction.ExistsPoint3D(point2D.point3D_id)) {
-      continue;
-    }
-    const double d2 = (point2D.xy - xy).squaredNorm();
-    if (d2 < best) {
-      best = d2;
-      *best_idx = i;
-      found = true;
-    }
-  }
-  return found;
-}
-
-bool FindBestTriangulatedByDesc(const Image& image,
-                                const Reconstruction& reconstruction,
-                                const Eigen::Vector2d& xy,
-                                const double radius_sq,
-                                const float desc_max_l2_sq,
-                                const std::unordered_set<point2D_t>& used,
-                                const point3D_t skip_point3D,
-                                const FeatureDescriptors& src_desc,
-                                const point2D_t src_idx,
-                                const FeatureDescriptors& dst_desc,
-                                point2D_t* best_idx) {
-  float best_l2 = desc_max_l2_sq;
-  bool found = false;
-  for (point2D_t i = 0; i < image.NumPoints2D(); ++i) {
-    if (used.count(i) > 0) {
-      continue;
-    }
-    const Point2D& point2D = image.Point2D(i);
-    if (!point2D.HasPoint3D() || point2D.point3D_id == skip_point3D ||
-        !reconstruction.ExistsPoint3D(point2D.point3D_id)) {
-      continue;
-    }
-    if ((point2D.xy - xy).squaredNorm() >= radius_sq) {
-      continue;
-    }
-    const float l2 = DescriptorL2Sq(src_desc, src_idx, dst_desc, i);
-    if (l2 < best_l2) {
-      best_l2 = l2;
-      *best_idx = i;
-      found = true;
-    }
-  }
-  return found;
-}
-
-void AppendSim3Corr(const Image& current,
-                    const Image& other,
-                    const Image& candidate,
-                    const Reconstruction& reconstruction,
-                    const point2D_t idx_current,
-                    const point2D_t idx_other,
-                    std::unordered_set<point2D_t>* used_current,
-                    std::vector<LoopSim3Corr>* corrs) {
-  if (idx_current >= current.NumPoints2D() ||
-      idx_other >= other.NumPoints2D()) {
-    return;
-  }
-  if (used_current != nullptr && used_current->count(idx_current) > 0) {
-    return;
-  }
-  const Point2D& p_current = current.Point2D(idx_current);
-  const Point2D& p_other = other.Point2D(idx_other);
-  if (!p_current.HasPoint3D() || !p_other.HasPoint3D() ||
-      p_current.point3D_id == p_other.point3D_id ||
-      !reconstruction.ExistsPoint3D(p_current.point3D_id) ||
-      !reconstruction.ExistsPoint3D(p_other.point3D_id) ||
-      !other.HasCameraPtr()) {
-    return;
-  }
-  const Eigen::Vector3d xyz_cam_current =
-      current.CamFromWorld() * reconstruction.Point3D(p_current.point3D_id).xyz;
-  const Eigen::Vector3d xyz_cam_other =
-      other.CamFromWorld() * reconstruction.Point3D(p_other.point3D_id).xyz;
-  const Eigen::Vector3d xyz_cam_candidate =
-      candidate.CamFromWorld() * reconstruction.Point3D(p_other.point3D_id).xyz;
-  if (xyz_cam_current.z() <= 0.0 || xyz_cam_other.z() <= 0.0) {
-    return;
-  }
-  LoopSim3Corr corr;
-  corr.xyz_cam_current = xyz_cam_current;
-  corr.xyz_cam_candidate = xyz_cam_candidate;
-  corr.xyz_cam_other = xyz_cam_other;
-  corr.xy_current = p_current.xy;
-  corr.xy_other = p_other.xy;
-  if (other.ImageId() == candidate.ImageId()) {
-    corr.other_from_cand = Sim3d();
-  } else {
-    corr.other_from_cand = ToSim3(other.CamFromWorld() *
-                                  Inverse(candidate.CamFromWorld()));
-  }
-  corr.cam_other = other.CameraPtr();
-  corr.other_id = other.ImageId();
-  corr.idx_current = idx_current;
-  corr.idx_other = idx_other;
-  corr.current_point3D_id = p_current.point3D_id;
-  corr.other_point3D_id = p_other.point3D_id;
-  corrs->push_back(corr);
-  if (used_current != nullptr) {
-    used_current->insert(idx_current);
-  }
-}
-
-bool CollectLoopSim3Corrs(const image_t image_id,
-                          const image_t other_id,
-                          const image_t candidate_id,
-                          const FeatureMatches& matches,
-                          const Reconstruction& reconstruction,
-                          std::unordered_set<point2D_t>* used_current,
-                          std::vector<LoopSim3Corr>* corrs) {
-  if (!reconstruction.ExistsImage(image_id) ||
-      !reconstruction.ExistsImage(other_id) ||
-      !reconstruction.ExistsImage(candidate_id)) {
-    return false;
-  }
-  const Image& current = reconstruction.Image(image_id);
-  const Image& other = reconstruction.Image(other_id);
-  const Image& candidate = reconstruction.Image(candidate_id);
-  if (!current.HasPose() || !other.HasPose() || !candidate.HasPose() ||
-      !current.HasCameraPtr() || !other.HasCameraPtr() ||
-      !candidate.HasCameraPtr()) {
-    return false;
-  }
-  corrs->reserve(corrs->size() + matches.size());
+// Matches from ReadMatches(loop_image, current): idx1 = loop image, idx2 =
+// current. Every loop-side keypoint with a 3D point gives one 2D–3D pair.
+void CollectLoopPnPCorrs(const Image& current,
+                         const Image& loop_image,
+                         const Reconstruction& reconstruction,
+                         const FeatureMatches& matches,
+                         std::unordered_set<point2D_t>* used_current,
+                         std::unordered_set<point3D_t>* used_points,
+                         std::vector<LoopPnPCorr>* corrs) {
   for (const FeatureMatch& match : matches) {
-    AppendSim3Corr(current,
-                   other,
-                   candidate,
-                   reconstruction,
-                   match.point2D_idx2,
-                   match.point2D_idx1,
-                   used_current,
-                   corrs);
-  }
-  return true;
-}
-
-void SearchBySim3(const Image& current, const Image& candidate,
-                  const Reconstruction& reconstruction,
-                  const Sim3d& cand_from_cur,
-                  const FeatureDescriptors& desc_current,
-                  const FeatureDescriptors& desc_candidate,
-                  const OnlineSim3SolverOptions& sim3_options,
-                  std::vector<LoopSim3Corr>* corrs) {
-  if (desc_current.data.rows() == 0 || desc_candidate.data.rows() == 0) {
-    return;
-  }
-  std::unordered_set<point2D_t> used_current;
-  std::unordered_set<point2D_t> used_candidate;
-  used_current.reserve(corrs->size());
-  used_candidate.reserve(corrs->size());
-  for (const LoopSim3Corr& corr : *corrs) {
-    used_current.insert(corr.idx_current);
-    if (corr.other_id == candidate.ImageId()) {
-      used_candidate.insert(corr.idx_other);
-    }
-  }
-  const double radius_sq =
-      sim3_options.guided_radius_px * sim3_options.guided_radius_px;
-  const Sim3d cur_from_cand = Inverse(cand_from_cur);
-
-  std::vector<int> match_cur_to_cand(current.NumPoints2D(), -1);
-  std::vector<int> match_cand_to_cur(candidate.NumPoints2D(), -1);
-
-  for (point2D_t i = 0; i < current.NumPoints2D(); ++i) {
-    if (used_current.count(i) > 0) {
+    const point2D_t idx_current = match.point2D_idx2;
+    const point2D_t idx_loop = match.point2D_idx1;
+    if (idx_current >= current.NumPoints2D() ||
+        idx_loop >= loop_image.NumPoints2D() ||
+        used_current->count(idx_current) > 0) {
       continue;
     }
-    const Point2D& p = current.Point2D(i);
-    if (!p.HasPoint3D() || !reconstruction.ExistsPoint3D(p.point3D_id)) {
+    const Point2D& p_loop = loop_image.Point2D(idx_loop);
+    if (!p_loop.HasPoint3D() ||
+        !reconstruction.ExistsPoint3D(p_loop.point3D_id) ||
+        used_points->count(p_loop.point3D_id) > 0) {
       continue;
     }
-    const Eigen::Vector3d xyz_cam =
-        current.CamFromWorld() * reconstruction.Point3D(p.point3D_id).xyz;
-    const auto proj =
-        ProjectCam(*candidate.CameraPtr(), cand_from_cur * xyz_cam);
-    if (!proj) {
-      continue;
-    }
-    point2D_t j = kInvalidPoint2DIdx;
-    if (FindBestTriangulatedByDesc(candidate,
-                                   reconstruction,
-                                   *proj,
-                                   radius_sq,
-                                   sim3_options.desc_max_l2_sq,
-                                   used_candidate,
-                                   p.point3D_id,
-                                   desc_current,
-                                   i,
-                                   desc_candidate,
-                                   &j)) {
-      match_cur_to_cand[i] = static_cast<int>(j);
-    }
-  }
-
-  for (point2D_t j = 0; j < candidate.NumPoints2D(); ++j) {
-    if (used_candidate.count(j) > 0) {
-      continue;
-    }
-    const Point2D& p = candidate.Point2D(j);
-    if (!p.HasPoint3D() || !reconstruction.ExistsPoint3D(p.point3D_id)) {
-      continue;
-    }
-    const Eigen::Vector3d xyz_cam =
-        candidate.CamFromWorld() * reconstruction.Point3D(p.point3D_id).xyz;
-    const auto proj =
-        ProjectCam(*current.CameraPtr(), cur_from_cand * xyz_cam);
-    if (!proj) {
-      continue;
-    }
-    point2D_t i = kInvalidPoint2DIdx;
-    if (FindBestTriangulatedByDesc(current,
-                                   reconstruction,
-                                   *proj,
-                                   radius_sq,
-                                   sim3_options.desc_max_l2_sq,
-                                   used_current,
-                                   p.point3D_id,
-                                   desc_candidate,
-                                   j,
-                                   desc_current,
-                                   &i)) {
-      match_cand_to_cur[j] = static_cast<int>(i);
-    }
-  }
-
-  for (point2D_t i = 0; i < current.NumPoints2D(); ++i) {
-    const int j = match_cur_to_cand[i];
-    if (j < 0) {
-      continue;
-    }
-    if (match_cand_to_cur[j] != static_cast<int>(i)) {
-      continue;
-    }
-    if (used_current.count(i) > 0 ||
-        used_candidate.count(static_cast<point2D_t>(j)) > 0) {
-      continue;
-    }
-    AppendSim3Corr(current,
-                   candidate,
-                   candidate,
-                   reconstruction,
-                   i,
-                   static_cast<point2D_t>(j),
-                   &used_current,
-                   corrs);
-    used_current.insert(i);
-    used_candidate.insert(static_cast<point2D_t>(j));
+    LoopPnPCorr corr;
+    corr.idx_current = idx_current;
+    corr.point3D_id = p_loop.point3D_id;
+    corr.xy_current = current.Point2D(idx_current).xy;
+    corrs->push_back(corr);
+    used_current->insert(idx_current);
+    used_points->insert(p_loop.point3D_id);
   }
 }
 
-size_t CountProjectedLoopMatches(const Image& current,
-                                 const Image& candidate,
-                                 const Reconstruction& reconstruction,
-                                 const std::vector<image_t>& loop_image_ids,
-                                 const Sim3d& cand_from_cur,
-                                 const OnlineSim3SolverOptions& sim3_options,
-                                 const std::vector<LoopSim3Corr>& corrs) {
-  std::unordered_set<point3D_t> already;
-  already.reserve(corrs.size());
-  for (const LoopSim3Corr& corr : corrs) {
-    if (corr.other_point3D_id != kInvalidPoint3DId) {
-      already.insert(corr.other_point3D_id);
-    }
-  }
-
-  std::unordered_set<point3D_t> loop_points;
-  for (const image_t id : loop_image_ids) {
-    if (!reconstruction.ExistsImage(id) ||
-        !reconstruction.Image(id).HasPose()) {
+std::vector<char> ComputePnPInliers(const std::vector<LoopPnPCorr>& corrs,
+                                    const Reconstruction& reconstruction,
+                                    const Rigid3d& cam_from_world,
+                                    const Camera& camera,
+                                    const double max_error_px) {
+  const double max_sq = max_error_px * max_error_px;
+  std::vector<char> inliers(corrs.size(), 0);
+  for (size_t i = 0; i < corrs.size(); ++i) {
+    if (!reconstruction.ExistsPoint3D(corrs[i].point3D_id)) {
       continue;
     }
-    const Image& image = reconstruction.Image(id);
-    for (const Point2D& point2D : image.Points2D()) {
-      if (point2D.HasPoint3D() &&
-          reconstruction.ExistsPoint3D(point2D.point3D_id)) {
-        loop_points.insert(point2D.point3D_id);
+    const double err = CalculateSquaredReprojectionError(
+        corrs[i].xy_current,
+        reconstruction.Point3D(corrs[i].point3D_id).xyz,
+        cam_from_world,
+        camera);
+    inliers[i] = err <= max_sq ? 1 : 0;
+  }
+  return inliers;
+}
+
+// Project loop-map points with the PnP pose into the current image and take
+// the descriptor-closest keypoint inside `radius_px` (ORB SearchByProjection).
+size_t SearchLoopByProjection(
+    const Image& current,
+    const Reconstruction& reconstruction,
+    const Rigid3d& cam_from_world,
+    const std::vector<image_t>& loop_ids,
+    const std::unordered_map<image_t, FeatureDescriptors>& loop_desc,
+    const FeatureDescriptors& desc_current,
+    const double radius_px,
+    std::unordered_set<point2D_t>* used_current,
+    std::unordered_set<point3D_t>* used_points,
+    std::vector<LoopPnPCorr>* corrs) {
+  if (desc_current.data.rows() == 0 || !current.HasCameraPtr()) {
+    return 0;
+  }
+  const Camera& camera = *current.CameraPtr();
+  const double radius_sq = radius_px * radius_px;
+  size_t added = 0;
+  for (const image_t loop_id : loop_ids) {
+    const auto desc_it = loop_desc.find(loop_id);
+    if (desc_it == loop_desc.end() || !reconstruction.ExistsImage(loop_id)) {
+      continue;
+    }
+    const Image& loop_image = reconstruction.Image(loop_id);
+    for (point2D_t j = 0; j < loop_image.NumPoints2D(); ++j) {
+      const Point2D& p_loop = loop_image.Point2D(j);
+      if (!p_loop.HasPoint3D() ||
+          !reconstruction.ExistsPoint3D(p_loop.point3D_id) ||
+          used_points->count(p_loop.point3D_id) > 0) {
+        continue;
       }
+      const auto proj = ProjectCam(
+          camera,
+          cam_from_world * reconstruction.Point3D(p_loop.point3D_id).xyz);
+      if (!proj || !InsideImage(camera, *proj)) {
+        continue;
+      }
+      float best_l2 = kLoopDescMaxL2Sq;
+      point2D_t best_idx = kInvalidPoint2DIdx;
+      for (point2D_t i = 0; i < current.NumPoints2D(); ++i) {
+        if (used_current->count(i) > 0 ||
+            (current.Point2D(i).xy - *proj).squaredNorm() >= radius_sq) {
+          continue;
+        }
+        const float l2 = DescriptorL2Sq(desc_it->second, j, desc_current, i);
+        if (l2 < best_l2) {
+          best_l2 = l2;
+          best_idx = i;
+        }
+      }
+      if (best_idx == kInvalidPoint2DIdx) {
+        continue;
+      }
+      LoopPnPCorr corr;
+      corr.idx_current = best_idx;
+      corr.point3D_id = p_loop.point3D_id;
+      corr.xy_current = current.Point2D(best_idx).xy;
+      corrs->push_back(corr);
+      used_current->insert(best_idx);
+      used_points->insert(p_loop.point3D_id);
+      ++added;
     }
   }
+  return added;
+}
 
-  const double radius_sq =
-      sim3_options.projection_radius_px * sim3_options.projection_radius_px;
-  const Sim3d cur_from_cand = Inverse(cand_from_cur);
-  const std::unordered_set<point2D_t> none_used;
-  size_t extra = 0;
-  for (const point3D_t point3D_id : loop_points) {
-    if (already.count(point3D_id) > 0) {
-      continue;
-    }
-    const Eigen::Vector3d xyz_cam_cand =
-        candidate.CamFromWorld() * reconstruction.Point3D(point3D_id).xyz;
-    const auto proj =
-        ProjectCam(*current.CameraPtr(), cur_from_cand * xyz_cam_cand);
-    if (!proj) {
-      continue;
-    }
-    point2D_t idx = kInvalidPoint2DIdx;
-    if (FindNearestTriangulated(current,
-                                reconstruction,
-                                *proj,
-                                radius_sq,
-                                none_used,
-                                point3D_id,
-                                &idx)) {
-      ++extra;
-    }
+// Rotation angle between the PnP-implied relative pose and the essential
+// matrix pose of the same pair (image1 = candidate, image2 = current).
+// Returns -1 when the essential matrix is unavailable.
+double RotationVsEssentialDeg(const TwoViewGeometry& geometry,
+                              const Image& candidate,
+                              const Image& current,
+                              const Rigid3d& current_cam_from_world,
+                              double* tdir_deg) {
+  *tdir_deg = -1.0;
+  if (!geometry.E || geometry.inlier_matches.size() < 8 ||
+      !candidate.HasCameraPtr() || !current.HasCameraPtr()) {
+    return -1.0;
   }
-  return extra;
+  std::vector<Eigen::Vector3d> rays1;
+  std::vector<Eigen::Vector3d> rays2;
+  rays1.reserve(geometry.inlier_matches.size());
+  rays2.reserve(geometry.inlier_matches.size());
+  for (const FeatureMatch& m : geometry.inlier_matches) {
+    if (m.point2D_idx1 >= candidate.NumPoints2D() ||
+        m.point2D_idx2 >= current.NumPoints2D()) {
+      continue;
+    }
+    const auto n1 =
+        candidate.CameraPtr()->CamFromImg(candidate.Point2D(m.point2D_idx1).xy);
+    const auto n2 =
+        current.CameraPtr()->CamFromImg(current.Point2D(m.point2D_idx2).xy);
+    if (!n1 || !n2) {
+      continue;
+    }
+    rays1.push_back(n1->homogeneous().normalized());
+    rays2.push_back(n2->homogeneous().normalized());
+  }
+  if (rays1.size() < 8) {
+    return -1.0;
+  }
+  Rigid3d e_cur_from_cand;
+  std::vector<int> valid;
+  PoseFromEssentialMatrix(*geometry.E, rays1, rays2, &e_cur_from_cand, &valid);
+  if (valid.empty()) {
+    return -1.0;
+  }
+  const Rigid3d pnp_cur_from_cand =
+      current_cam_from_world * Inverse(candidate.CamFromWorld());
+  const Eigen::Vector3d t_pnp = pnp_cur_from_cand.translation();
+  const Eigen::Vector3d t_e = e_cur_from_cand.translation();
+  if (t_pnp.norm() > 1e-6 && t_e.norm() > 1e-6) {
+    *tdir_deg = RadToDeg(std::acos(
+        std::clamp(t_pnp.normalized().dot(t_e.normalized()), -1.0, 1.0)));
+  }
+  return RotationDiffDeg(pnp_cur_from_cand.rotation(),
+                         e_cur_from_cand.rotation());
 }
 
 void DrawPixel(Bitmap* image,
@@ -658,8 +480,9 @@ bool LoadKeyframeBitmap(const image_t image_id,
 
 // Per query folder: query_XXXXXX/
 //   qA_cB_01_matches.png          feature / essential matches
-//   qA_cB_02_n3d.png              3D-3D corrs (different Point3D ids)
-//   qA_cB_03_ransac_inliers.png   EstimateSim3Orb inliers
+//   qA_cB_02_n3d.png              2D (current) – 3D (loop map) pairs
+//   qA_cB_03_pnp_inliers.png      PnP inliers after guided matching
+// 2D–3D pairs are drawn against the map point's projection into the candidate.
 void DumpLoopVerifyVisuals(
     const std::string& loop_verify_dir,
     const std::string& database_path,
@@ -669,8 +492,8 @@ void DumpLoopVerifyVisuals(
     const DatabaseCache& cache,
     const Reconstruction& reconstruction,
     const FeatureMatches& matches,
-    const std::vector<LoopSim3Corr>& corrs,
-    const std::vector<char>& ransac_inliers) {
+    const std::vector<LoopPnPCorr>& corrs,
+    const std::vector<char>& pnp_inliers) {
   if (loop_verify_dir.empty()) {
     return;
   }
@@ -748,51 +571,32 @@ void DumpLoopVerifyVisuals(
     SavePairs("01_matches", pairs, BitmapColor<uint8_t>(0, 255, 0));
   }
 
-  {
+  const auto CorrPairs = [&](const bool inliers_only) {
     std::vector<std::pair<Eigen::Vector2d, Eigen::Vector2d>> pairs;
-    pairs.reserve(corrs.size());
-    for (const LoopSim3Corr& corr : corrs) {
-      pairs.emplace_back(corr.xy_current, corr.xy_other);
+    if (!candidate.HasPose() || !candidate.HasCameraPtr()) {
+      return pairs;
     }
-    SavePairs("02_n3d", pairs, BitmapColor<uint8_t>(0, 200, 255));
-  }
-
-  {
-    std::vector<std::pair<Eigen::Vector2d, Eigen::Vector2d>> pairs;
     pairs.reserve(corrs.size());
     for (size_t i = 0; i < corrs.size(); ++i) {
-      if (i >= ransac_inliers.size() || !ransac_inliers[i]) {
+      if (inliers_only && (i >= pnp_inliers.size() || !pnp_inliers[i])) {
         continue;
       }
-      pairs.emplace_back(corrs[i].xy_current, corrs[i].xy_other);
+      if (!reconstruction.ExistsPoint3D(corrs[i].point3D_id)) {
+        continue;
+      }
+      const auto proj = ProjectCam(
+          *candidate.CameraPtr(),
+          candidate.CamFromWorld() *
+              reconstruction.Point3D(corrs[i].point3D_id).xyz);
+      if (proj && InsideImage(*candidate.CameraPtr(), *proj)) {
+        pairs.emplace_back(corrs[i].xy_current, *proj);
+      }
     }
-    SavePairs("03_ransac_inliers", pairs, BitmapColor<uint8_t>(255, 64, 64));
-  }
-}
-
-bool FindNearestKeypoint(const Image& image,
-                         const Eigen::Vector2d& xy,
-                         const double radius_sq,
-                         const std::unordered_set<point2D_t>& used,
-                         point2D_t* best_idx) {
-  double best = radius_sq;
-  bool found = false;
-  for (point2D_t i = 0; i < image.NumPoints2D(); ++i) {
-    if (used.count(i) > 0) {
-      continue;
-    }
-    const double d2 = (image.Point2D(i).xy - xy).squaredNorm();
-    if (d2 < best) {
-      best = d2;
-      *best_idx = i;
-      found = true;
-    }
-  }
-  return found;
-}
-
-Rigid3d Sim3ToSE3(const Sim3d& sim3) {
-  return Rigid3d(sim3.rotation(), sim3.translation() / sim3.scale());
+    return pairs;
+  };
+  SavePairs("02_n3d", CorrPairs(false), BitmapColor<uint8_t>(0, 200, 255));
+  SavePairs(
+      "03_pnp_inliers", CorrPairs(true), BitmapColor<uint8_t>(255, 64, 64));
 }
 
 bool SetImagePose(Image& image, const Rigid3d& cam_from_world) {
@@ -825,14 +629,15 @@ OnlineLoopCloser::OnlineLoopCloser(std::string database_path,
                                "inliers",
                                "n3d",
                                "n3d_inliers",
-                               "scale",
-                               "sim3",
+                               "correction_m",
+                               "pnp",
                                "status",
                                "candidate_ids"});
   timing_->AddMeta("mixvpr_engine_path", options_.mixvpr_engine_path);
   timing_->AddMeta("mixvpr_use_gpu", options_.mixvpr_use_gpu ? "1" : "0");
   timing_->AddMeta("cooldown_num_images",
                    std::to_string(options_.cooldown_num_images));
+  timing_->AddMeta("min_frame_gap", std::to_string(options_.min_frame_gap));
   timing_->AddMeta("max_distance", std::to_string(options_.max_distance));
   timing_->AddMeta("max_view_angle_deg",
                    std::to_string(options_.max_view_angle_deg));
@@ -914,7 +719,7 @@ bool OnlineLoopCloser::Process(const image_t image_id,
                      "0",
                      "0",
                      "0",
-                     "1",
+                     "0",
                      "0",
                      "no_candidate",
                      "-"});
@@ -936,8 +741,8 @@ bool OnlineLoopCloser::Process(const image_t image_id,
          std::to_string(pair.num_inliers),
          std::to_string(pair.num_3d_correspondences),
          std::to_string(pair.num_3d_inliers),
-         std::to_string(pair.scale),
-         pair.used_sim3 ? "1" : "0",
+         std::to_string(pair.correction_m),
+         pair.has_loop_pose ? "1" : "0",
          status,
          "-"});
   };
@@ -987,8 +792,8 @@ bool OnlineLoopCloser::Process(const image_t image_id,
               << " inliers=" << loop_pair.num_inliers
               << " n3d=" << loop_pair.num_3d_correspondences
               << " n3d_inliers=" << loop_pair.num_3d_inliers
-              << " scale=" << loop_pair.scale
-              << " sim3=" << static_cast<int>(loop_pair.used_sim3);
+              << " correction_m=" << loop_pair.correction_m
+              << " correction_deg=" << loop_pair.correction_deg;
     RecordPair(loop_pair, "confirmed");
     break;
   }
@@ -1005,7 +810,7 @@ bool OnlineLoopCloser::Process(const image_t image_id,
                        "0",
                        "0",
                        "0",
-                       "1",
+                       "0",
                        "0",
                        "no_candidate",
                        "-"});
@@ -1014,11 +819,11 @@ bool OnlineLoopCloser::Process(const image_t image_id,
   }
 
   if (!options_.correct_local || obs_manager == nullptr ||
-      !confirmed_pair.used_sim3) {
+      !confirmed_pair.has_loop_pose) {
     return false;
   }
 
-  const bool ok = CorrectLocalLoop(reconstruction, obs_manager, confirmed_pair);
+  const bool ok = CorrectLoop(reconstruction, obs_manager, confirmed_pair);
   if (ok) {
     confirmed_loops_.back() = confirmed_pair;
   }
@@ -1137,6 +942,10 @@ std::vector<std::pair<image_t, float>> OnlineLoopCloser::DetectLoop(
     if (other_id == image_id) {
       return false;
     }
+    if (other_id + static_cast<image_t>(std::max(options_.min_frame_gap, 0)) >
+        image_id) {
+      return false;
+    }
     if (covis.count(other_id) > 0) {
       return false;
     }
@@ -1251,8 +1060,7 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
   loop_pair->image_id1 = image_id;
   loop_pair->image_id2 = candidate_id;
   loop_pair->retrieval_score = retrieval_score;
-  loop_pair->scale = 1.0;
-  loop_pair->used_sim3 = false;
+  loop_pair->has_loop_pose = false;
 
   try {
     DatabaseSession session(database_path_);
@@ -1318,29 +1126,26 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
   const FeatureMatches& verify_matches = geometry.inlier_matches.empty()
                                              ? matches
                                              : geometry.inlier_matches;
-  std::vector<LoopSim3Corr> corrs;
-  std::unordered_set<point2D_t> used_current;
-  if (!CollectLoopSim3Corrs(image_id,
-                            candidate_id,
-                            candidate_id,
-                            verify_matches,
-                            reconstruction,
-                            &used_current,
-                            &corrs)) {
-    return false;
-  }
-  loop_pair->num_3d_correspondences = corrs.size();
-  LOG(INFO) << "OnlineLoopCloser: n3d " << image_id << "-" << candidate_id
-            << " direct=" << corrs.size();
-
   const Image& current = reconstruction.Image(image_id);
   const Image& candidate = reconstruction.Image(candidate_id);
-  const bool can_sim3 =
-      current.HasPose() && candidate.HasPose() && current.HasCameraPtr() &&
-      candidate.HasCameraPtr() &&
-      corrs.size() >= static_cast<size_t>(options_.min_num_3d_correspondences);
+  if (!current.HasPose() || !candidate.HasPose() || !current.HasCameraPtr() ||
+      !candidate.HasCameraPtr()) {
+    return false;
+  }
 
-  if (!can_sim3) {
+  std::vector<LoopPnPCorr> corrs;
+  std::unordered_set<point2D_t> used_current;
+  std::unordered_set<point3D_t> used_points;
+  CollectLoopPnPCorrs(current,
+                      candidate,
+                      reconstruction,
+                      verify_matches,
+                      &used_current,
+                      &used_points,
+                      &corrs);
+  loop_pair->num_3d_correspondences = corrs.size();
+  if (corrs.size() <
+      static_cast<size_t>(options_.min_num_3d_correspondences)) {
     DumpLoopVerifyVisuals(loop_verify_dir_,
                           database_path_,
                           image_id,
@@ -1350,27 +1155,112 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
                           reconstruction,
                           verify_matches,
                           corrs,
-                          /*ransac_inliers=*/{});
+                          /*pnp_inliers=*/{});
     LOG(INFO) << "OnlineLoopCloser: reject " << image_id << "-" << candidate_id
-              << ", n3d=" << corrs.size()
+              << ", 2D-3D=" << corrs.size()
               << " inliers=" << geometry.inlier_matches.size();
     return false;
   }
 
-  Sim3d cand_from_cur;
+  std::vector<Eigen::Vector2d> points2D;
+  std::vector<Eigen::Vector3d> points3D;
+  const auto FillPoints = [&]() {
+    points2D.clear();
+    points3D.clear();
+    points2D.reserve(corrs.size());
+    points3D.reserve(corrs.size());
+    for (const LoopPnPCorr& corr : corrs) {
+      points2D.push_back(corr.xy_current);
+      points3D.push_back(reconstruction.Point3D(corr.point3D_id).xyz);
+    }
+  };
+  FillPoints();
+
+  Camera camera = *current.CameraPtr();
+  AbsolutePoseEstimationOptions abs_pose_options;
+  abs_pose_options.estimate_focal_length = false;
+  abs_pose_options.ransac_options.max_error = options_.pnp_max_error;
+  abs_pose_options.ransac_options.min_inlier_ratio = 0.1;
+  AbsolutePoseRefinementOptions refine_options;
+  refine_options.refine_focal_length = false;
+  refine_options.refine_extra_params = false;
+
+  Rigid3d cam_from_world;
+  size_t num_ransac_inliers = 0;
   std::vector<char> inliers;
-  int ransac_best_n = 0;
-  OnlineSim3SolverOptions sim3_options;
-  sim3_options.fix_scale = options_.fix_scale;
-  sim3_options.min_inliers = options_.min_num_3d_inliers;
-  const bool ransac_ok =
-      EstimateSim3Orb(ToOnlineSim3Corrs(corrs, candidate_id, *candidate.CameraPtr()),
-                      *current.CameraPtr(),
-                      *candidate.CameraPtr(),
-                      sim3_options,
-                      &cand_from_cur,
-                      &inliers,
-                      &ransac_best_n);
+  const bool pnp_ok = EstimateAbsolutePose(abs_pose_options,
+                                           points2D,
+                                           points3D,
+                                           &cam_from_world,
+                                           &camera,
+                                           &num_ransac_inliers,
+                                           &inliers);
+  loop_pair->num_3d_inliers = pnp_ok ? num_ransac_inliers : 0;
+  if (!pnp_ok || num_ransac_inliers <
+                     static_cast<size_t>(options_.min_num_3d_inliers)) {
+    DumpLoopVerifyVisuals(loop_verify_dir_,
+                          database_path_,
+                          image_id,
+                          candidate_id,
+                          query_abs_path,
+                          cache,
+                          reconstruction,
+                          verify_matches,
+                          corrs,
+                          inliers);
+    LOG(INFO) << "OnlineLoopCloser: reject " << image_id << "-" << candidate_id
+              << ", pnp ransac failed 2D-3D=" << corrs.size()
+              << " inliers=" << loop_pair->num_3d_inliers;
+    return false;
+  }
+  if (!RefineAbsolutePose(
+          refine_options, inliers, points2D, points3D, &cam_from_world, &camera)) {
+    LOG(INFO) << "OnlineLoopCloser: reject " << image_id << "-" << candidate_id
+              << ", pnp refine failed";
+    return false;
+  }
+
+  // Grow matches by projecting the whole loop-side local map.
+  const std::vector<image_t> loop_ids =
+      LoopMapImages(candidate_id, image_id, reconstruction);
+  std::unordered_map<image_t, FeatureDescriptors> loop_desc;
+  loop_desc.emplace(candidate_id, desc_candidate);
+  try {
+    DatabaseSession session(database_path_);
+    for (const image_t id : loop_ids) {
+      if (id != candidate_id && session->ExistsDescriptors(id)) {
+        loop_desc.emplace(id, session->ReadDescriptors(id));
+      }
+    }
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "OnlineLoopCloser: failed to read loop-map descriptors for "
+                 << image_id << "-" << candidate_id << ": " << e.what();
+  }
+  const size_t num_guided = SearchLoopByProjection(current,
+                                                   reconstruction,
+                                                   cam_from_world,
+                                                   loop_ids,
+                                                   loop_desc,
+                                                   desc_current,
+                                                   options_.guided_radius_px,
+                                                   &used_current,
+                                                   &used_points,
+                                                   &corrs);
+  FillPoints();
+  inliers = ComputePnPInliers(
+      corrs, reconstruction, cam_from_world, camera, options_.pnp_max_error);
+  if (CountInliers(inliers) >=
+          static_cast<size_t>(options_.min_num_3d_inliers) &&
+      RefineAbsolutePose(refine_options,
+                         inliers,
+                         points2D,
+                         points3D,
+                         &cam_from_world,
+                         &camera)) {
+    inliers = ComputePnPInliers(
+        corrs, reconstruction, cam_from_world, camera, options_.pnp_max_error);
+  }
+  const size_t num_pnp_inliers = CountInliers(inliers);
   DumpLoopVerifyVisuals(loop_verify_dir_,
                         database_path_,
                         image_id,
@@ -1381,308 +1271,301 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
                         verify_matches,
                         corrs,
                         inliers);
-  if (!ransac_ok) {
-    loop_pair->num_3d_inliers = static_cast<size_t>(std::max(ransac_best_n, 0));
+
+  const Rigid3d& pose_before = current.CamFromWorld();
+  loop_pair->correction_m =
+      (cam_from_world.TgtOriginInSrc() - pose_before.TgtOriginInSrc()).norm();
+  loop_pair->correction_deg =
+      RotationDiffDeg(cam_from_world.rotation(), pose_before.rotation());
+  double tdir_vs_essential_deg = -1.0;
+  loop_pair->rot_vs_essential_deg = RotationVsEssentialDeg(
+      geometry, candidate, current, cam_from_world, &tdir_vs_essential_deg);
+  const double baseline_m =
+      (cam_from_world.TgtOriginInSrc() -
+       candidate.CamFromWorld().TgtOriginInSrc())
+          .norm();
+  LOG(INFO) << "OnlineLoopCloser: pnp " << image_id << "-" << candidate_id
+            << " 2D-3D=" << corrs.size() << " guided=" << num_guided
+            << " ransac_inliers=" << num_ransac_inliers
+            << " inliers=" << num_pnp_inliers
+            << " loop_map=" << loop_ids.size()
+            << " baseline_m=" << baseline_m
+            << " correction_m=" << loop_pair->correction_m
+            << " correction_deg=" << loop_pair->correction_deg
+            << " rot_vs_E_deg=" << loop_pair->rot_vs_essential_deg
+            << " tdir_vs_E_deg=" << tdir_vs_essential_deg;
+
+  if (num_pnp_inliers <
+      static_cast<size_t>(options_.min_num_verified_matches)) {
     LOG(INFO) << "OnlineLoopCloser: reject " << image_id << "-" << candidate_id
-              << ", sim3 ransac failed n3d=" << corrs.size()
-              << " best_inliers=" << ransac_best_n;
+              << ", pnp weak inliers=" << num_pnp_inliers;
+    return false;
+  }
+  if (options_.max_rot_vs_essential_deg > 0.0 &&
+      loop_pair->rot_vs_essential_deg > options_.max_rot_vs_essential_deg) {
+    LOG(INFO) << "OnlineLoopCloser: reject " << image_id << "-" << candidate_id
+              << ", pnp rotation disagrees with essential by "
+              << loop_pair->rot_vs_essential_deg << " deg";
+    return false;
+  }
+  if (loop_pair->correction_m > options_.max_correction_m ||
+      loop_pair->correction_deg > options_.max_correction_deg) {
+    LOG(INFO) << "OnlineLoopCloser: reject " << image_id << "-" << candidate_id
+              << ", correction too large " << loop_pair->correction_m
+              << " m / " << loop_pair->correction_deg << " deg";
     return false;
   }
 
-  loop_pair->num_3d_inliers = CountInliers(inliers);
-
-  SearchBySim3(current,
-               candidate,
-               reconstruction,
-               cand_from_cur,
-               desc_current,
-               desc_candidate,
-               sim3_options,
-               &corrs);
-  // ORB: guided matching → OptimizeSim3 again.
-  {
-    auto online_corrs =
-        ToOnlineSim3Corrs(corrs, candidate_id, *candidate.CameraPtr());
-    inliers = ComputeSim3ReprojInliers(cand_from_cur,
-                                       *current.CameraPtr(),
-                                       *candidate.CameraPtr(),
-                                       online_corrs,
-                                       sim3_options.max_reproj_error_px);
-    OptimizeSim3Orb(online_corrs,
-                    *current.CameraPtr(),
-                    *candidate.CameraPtr(),
-                    sim3_options,
-                    &cand_from_cur,
-                    &inliers);
-  }
-
-  std::vector<image_t> covis_ids;
-  const std::unordered_set<image_t> covis_group =
-      CovisibilityGroup(candidate_id, reconstruction);
-  const std::vector<image_t> ranked =
-      RankedCovisible(candidate_id, reconstruction);
-  covis_ids.reserve(sim3_options.max_loop_covis_images);
-  for (const image_t covis_id : ranked) {
-    if (covis_id == image_id || covis_id == candidate_id) {
-      continue;
-    }
-    if (covis_group.count(covis_id) == 0) {
-      continue;
-    }
-    if (!reconstruction.ExistsImage(covis_id) ||
-        !reconstruction.Image(covis_id).HasPose() ||
-        !reconstruction.Image(covis_id).HasCameraPtr()) {
-      continue;
-    }
-    covis_ids.push_back(covis_id);
-    if (covis_ids.size() >=
-        static_cast<size_t>(sim3_options.max_loop_covis_images)) {
-      break;
+  loop_pair->has_loop_pose = true;
+  loop_pair->loop_cam_from_world = cam_from_world;
+  loop_pair->loop_observations.clear();
+  loop_pair->loop_observations.reserve(num_pnp_inliers);
+  for (size_t i = 0; i < corrs.size(); ++i) {
+    if (inliers[i]) {
+      loop_pair->loop_observations.emplace_back(corrs[i].idx_current,
+                                                corrs[i].point3D_id);
     }
   }
-  const size_t n3d_after_sim3 = corrs.size();
-  if (!covis_ids.empty()) {
-    if (!matcher->MatchSpecificPairs(image_id, covis_ids, cache)) {
-      LOG(WARNING) << "OnlineLoopCloser: covis matching " << image_id << "-"
-                   << candidate_id << " failed";
-    } else {
-      used_current.clear();
-      for (const LoopSim3Corr& corr : corrs) {
-        used_current.insert(corr.idx_current);
-      }
-      try {
-        DatabaseSession session(database_path_);
-        for (const image_t covis_id : covis_ids) {
-          FeatureMatches covis_matches;
-          TwoViewGeometry covis_geometry;
-          if (session->ExistsMatches(covis_id, image_id)) {
-            covis_matches = session->ReadMatches(covis_id, image_id);
-          }
-          if (session->ExistsTwoViewGeometry(covis_id, image_id)) {
-            covis_geometry = session->ReadTwoViewGeometry(covis_id, image_id);
-          }
-          if (covis_matches.size() <
-              static_cast<size_t>(options_.min_num_matches)) {
-            continue;
-          }
-          const FeatureMatches& covis_verify =
-              covis_geometry.inlier_matches.empty()
-                  ? covis_matches
-                  : covis_geometry.inlier_matches;
-          CollectLoopSim3Corrs(image_id,
-                               covis_id,
-                               candidate_id,
-                               covis_verify,
-                               reconstruction,
-                               &used_current,
-                               &corrs);
-        }
-      } catch (const std::exception& e) {
-        LOG(WARNING) << "OnlineLoopCloser: failed to read covis pairs for "
-                     << image_id << "-" << candidate_id << ": " << e.what();
-      }
-      inliers = ComputeReprojInliers(cand_from_cur,
-                                     *current.CameraPtr(),
-                                     *candidate.CameraPtr(),
-                                     candidate_id,
-                                     corrs,
-                                     sim3_options.max_reproj_error_px);
-    }
-  }
-  LOG(INFO) << "OnlineLoopCloser: n3d " << image_id << "-" << candidate_id
-            << " after_sim3=" << n3d_after_sim3
-            << " covis_frames=" << covis_ids.size()
-            << " total=" << corrs.size();
-  loop_pair->num_3d_correspondences = corrs.size();
-  loop_pair->num_3d_inliers = CountInliers(inliers);
-  std::vector<image_t> loop_ids = RankedCovisible(candidate_id, reconstruction);
-  loop_ids.push_back(candidate_id);
-  const size_t extra = CountProjectedLoopMatches(current,
-                                                 candidate,
-                                                 reconstruction,
-                                                 loop_ids,
-                                                 cand_from_cur,
-                                                 sim3_options,
-                                                 corrs);
-  const size_t total = loop_pair->num_3d_inliers + extra;
-
-  if (loop_pair->num_3d_inliers >=
-          static_cast<size_t>(options_.min_num_3d_inliers) &&
-      total >= static_cast<size_t>(options_.min_num_verified_matches)) {
-    loop_pair->scale = cand_from_cur.scale();
-    loop_pair->used_sim3 = true;
-    loop_pair->cand_from_cur = cand_from_cur;
-    loop_pair->matched_point3Ds.clear();
-    loop_pair->matched_point3Ds.reserve(loop_pair->num_3d_inliers);
-    for (size_t i = 0; i < corrs.size(); ++i) {
-      if (i >= inliers.size() || !inliers[i]) {
-        continue;
-      }
-      const LoopSim3Corr& corr = corrs[i];
-      if (corr.current_point3D_id == kInvalidPoint3DId ||
-          corr.other_point3D_id == kInvalidPoint3DId ||
-          corr.current_point3D_id == corr.other_point3D_id) {
-        continue;
-      }
-      loop_pair->matched_point3Ds.emplace_back(corr.current_point3D_id,
-                                               corr.other_point3D_id);
-    }
-    LOG(INFO) << "OnlineLoopCloser: accept " << image_id << "-" << candidate_id
-              << " by sim3 inliers=" << loop_pair->num_3d_inliers
-              << " projected=" << extra << " total=" << total
-              << " fix_scale=" << options_.fix_scale
-              << " scale=" << loop_pair->scale
-              << " t=[" << cand_from_cur.translation().transpose() << "]"
-              << " fuse_pairs=" << loop_pair->matched_point3Ds.size();
-    return true;
-  }
-
-  LOG(INFO) << "OnlineLoopCloser: reject " << image_id << "-" << candidate_id
-            << ", sim3 weak inliers=" << loop_pair->num_3d_inliers
-            << " projected=" << extra << " total=" << total
-            << " ransac_best=" << ransac_best_n;
-  return false;
+  LOG(INFO) << "OnlineLoopCloser: accept " << image_id << "-" << candidate_id
+            << " by pnp inliers=" << num_pnp_inliers
+            << " correction_m=" << loop_pair->correction_m
+            << " correction_deg=" << loop_pair->correction_deg;
+  return true;
 }
 
-bool OnlineLoopCloser::CorrectLocalLoop(Reconstruction& reconstruction,
-                                        ObservationManager* obs_manager,
-                                        const OnlineLoopPair& loop_pair) {
-  if (obs_manager == nullptr) {
+bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
+                                   ObservationManager* obs_manager,
+                                   const OnlineLoopPair& loop_pair) {
+  if (obs_manager == nullptr || !loop_pair.has_loop_pose) {
     return false;
   }
-  const image_t id1 = loop_pair.image_id1;
-  const image_t id2 = loop_pair.image_id2;
-  if (!reconstruction.ExistsImage(id1) || !reconstruction.ExistsImage(id2)) {
-    return false;
-  }
-
-  // Older map side has the smaller strong-covisible image id → anchor.
-  const image_t min1 = MinCovisibilityImageId(id1, reconstruction);
-  const image_t min2 = MinCovisibilityImageId(id2, reconstruction);
-  // Default: current=id1, loop=id2 (matches VerifyCandidate orientation).
-  const bool id1_is_newer =
-      (min1 > min2) || (min1 == min2 && id1 > id2);
-
-  image_t current_id = id1;
-  image_t loop_id = id2;
-  Sim3d loop_from_current = loop_pair.cand_from_cur;
-  std::vector<std::pair<point3D_t, point3D_t>> matched_point3Ds =
-      loop_pair.matched_point3Ds;
-  if (!id1_is_newer) {
-    std::swap(current_id, loop_id);
-    loop_from_current = Inverse(loop_from_current);
-    for (auto& pair : matched_point3Ds) {
-      std::swap(pair.first, pair.second);
-    }
-  }
-  LOG(INFO) << "OnlineLoopCloser: CorrectLocalLoop sides"
-            << " id1=" << id1 << "(min_covis=" << min1 << ")"
-            << " id2=" << id2 << "(min_covis=" << min2 << ")"
-            << " → current=" << current_id << " loop_anchor=" << loop_id
-            << (id1_is_newer ? " (no swap)" : " (swapped)");
-
-  Image& current = reconstruction.Image(current_id);
-  Image& loop_image = reconstruction.Image(loop_id);
-  if (!current.HasPose() || !loop_image.HasPose() || !current.HasFramePtr()) {
+  const image_t current_id = loop_pair.image_id1;
+  const image_t loop_id = loop_pair.image_id2;
+  if (!reconstruction.ExistsImage(current_id) ||
+      !reconstruction.ExistsImage(loop_id) ||
+      !reconstruction.Image(current_id).HasPose() ||
+      !reconstruction.Image(loop_id).HasPose()) {
     return false;
   }
 
-  // Connected window: current + its strong covisibles, but never frames that
-  // already belong to the loop-anchor local map (e.g. 288 covisible with 2
-  // while 2 is also in 1's neighborhood — those stay fixed).
-  std::vector<image_t> connected;
-  connected.push_back(current_id);
-  const std::unordered_set<image_t> loop_side =
+  // Old map = loop candidate, its local map, and everything registered before.
+  const std::vector<image_t> loop_map_ids =
+      LoopMapImages(loop_id, current_id, reconstruction);
+  std::unordered_set<image_t> anchor_set =
       CovisibilityGroup(loop_id, reconstruction);
-  const auto shared = CountCovisibilityPoints(current_id, reconstruction);
-  const std::vector<image_t> ranked =
-      RankedCovisible(current_id, reconstruction);
-  const int max_connected =
-      std::max(1, options_.max_correct_connected);
-  size_t num_skipped_loop_side = 0;
-  for (const image_t id : ranked) {
-    if (id == current_id || id == loop_id) {
-      continue;
-    }
-    if (loop_side.count(id) > 0) {
-      ++num_skipped_loop_side;
-      continue;
-    }
-    if (!reconstruction.ExistsImage(id) ||
-        !reconstruction.Image(id).HasPose() ||
-        !reconstruction.Image(id).HasFramePtr()) {
-      continue;
-    }
-    const auto it = shared.find(id);
-    if (it == shared.end()) {
-      continue;
-    }
-    if (it->second < options_.min_covisibility_points &&
-        connected.size() > 1) {
-      continue;
-    }
-    connected.push_back(id);
-    if (static_cast<int>(connected.size()) >= max_connected) {
-      break;
-    }
-  }
-  if (num_skipped_loop_side > 0) {
-    LOG(INFO) << "OnlineLoopCloser: CorrectLocalLoop skip " << num_skipped_loop_side
-              << " loop-side covisible(s) of anchor " << loop_id;
+  anchor_set.insert(loop_map_ids.begin(), loop_map_ids.end());
+  anchor_set.erase(current_id);
+  image_t anchor_max = loop_id;
+  for (const image_t id : anchor_set) {
+    anchor_max = std::max(anchor_max, id);
   }
 
-  // Scw_corr = Inverse(loop_from_current) * Smw  (ORB: mg2oScw = gScm * gSmw)
-  const Sim3d Scw_corr =
-      Inverse(loop_from_current) * ToSim3(loop_image.CamFromWorld());
-  const Sim3d Swc_old = Inverse(ToSim3(current.CamFromWorld()));
-
-  std::unordered_map<image_t, Sim3d> corrected_sim3;
-  std::unordered_map<image_t, Sim3d> non_corrected_sim3;
-  corrected_sim3.reserve(connected.size());
-  non_corrected_sim3.reserve(connected.size());
-
-  for (const image_t id : connected) {
-    Image& image = reconstruction.Image(id);
-    const Sim3d Siw_old = ToSim3(image.CamFromWorld());
-    non_corrected_sim3[id] = Siw_old;
-    if (id == current_id) {
-      corrected_sim3[id] = Scw_corr;
-    } else {
-      const Sim3d Sic = Siw_old * Swc_old;
-      corrected_sim3[id] = Sic * Scw_corr;
+  std::vector<image_t> registered = reconstruction.RegImageIds();
+  std::sort(registered.begin(), registered.end());
+  std::vector<image_t> variable_ids;
+  image_t boundary_id = kInvalidImageId;
+  for (const image_t id : registered) {
+    if (id <= anchor_max || anchor_set.count(id) > 0) {
+      if (variable_ids.empty()) {
+        boundary_id = id;
+      }
+      continue;
+    }
+    if (id <= current_id && reconstruction.Image(id).HasFramePtr()) {
+      variable_ids.push_back(id);
     }
   }
+  const std::unordered_set<image_t> variable_set(variable_ids.begin(),
+                                                 variable_ids.end());
+  if (variable_set.count(current_id) == 0) {
+    LOG(INFO) << "OnlineLoopCloser: CorrectLoop skip " << current_id << "-"
+              << loop_id << ", current inside old map (anchor_max="
+              << anchor_max << ")";
+    return false;
+  }
 
-  // Stage B: correct map points then poses in the connected window.
-  std::unordered_set<point3D_t> corrected_points;
-  size_t num_points_corrected = 0;
-  size_t num_poses_corrected = 0;
-  for (const image_t id : connected) {
-    Image& image = reconstruction.Image(id);
-    const Sim3d& Siw_old = non_corrected_sim3[id];
-    const Sim3d& Siw_corr = corrected_sim3[id];
-    const Sim3d Swi_corr = Inverse(Siw_corr);
+  // Stage A: SE3 pose graph (odometry + covisibility + loop edge).
+  std::unordered_map<image_t, Rigid3d> poses_old;
+  for (const image_t id : variable_ids) {
+    poses_old[id] = reconstruction.Image(id).CamFromWorld();
+  }
+  poses_old[loop_id] = reconstruction.Image(loop_id).CamFromWorld();
+  if (boundary_id != kInvalidImageId) {
+    poses_old[boundary_id] = reconstruction.Image(boundary_id).CamFromWorld();
+  }
+  const auto Rel = [&](const image_t i, const image_t j) {
+    return poses_old.at(j) * Inverse(poses_old.at(i));
+  };
 
-    for (const Point2D& point2D : image.Points2D()) {
+  std::vector<PoseGraphEdge> edges;
+  image_t prev_id = boundary_id;
+  for (const image_t id : variable_ids) {
+    if (prev_id != kInvalidImageId) {
+      edges.push_back({prev_id, id, Rel(prev_id, id), 1.0});
+    }
+    prev_id = id;
+  }
+  // Old-map frames covisible with corrected frames (revisited areas) join as
+  // fixed nodes, so the shared points they keep stay consistent.
+  std::unordered_set<image_t> fixed_ids = {loop_id};
+  if (boundary_id != kInvalidImageId) {
+    fixed_ids.insert(boundary_id);
+  }
+  size_t num_covis_edges = 0;
+  size_t num_old_covis_edges = 0;
+  for (const image_t id : variable_ids) {
+    for (const auto& [other_id, count] :
+         CountCovisibilityPoints(id, reconstruction)) {
+      if (count < options_.pose_graph_min_covis) {
+        continue;
+      }
+      if (variable_set.count(other_id) > 0) {
+        if (other_id <= id) {
+          continue;
+        }
+        edges.push_back({id, other_id, Rel(id, other_id), 1.0});
+        ++num_covis_edges;
+        continue;
+      }
+      if (other_id > current_id || !reconstruction.ExistsImage(other_id) ||
+          !reconstruction.Image(other_id).HasPose()) {
+        continue;
+      }
+      if (poses_old.count(other_id) == 0) {
+        poses_old[other_id] = reconstruction.Image(other_id).CamFromWorld();
+      }
+      fixed_ids.insert(other_id);
+      edges.push_back({other_id, id, Rel(other_id, id), 1.0});
+      ++num_old_covis_edges;
+    }
+  }
+  edges.push_back({loop_id,
+                   current_id,
+                   loop_pair.loop_cam_from_world * Inverse(poses_old[loop_id]),
+                   kLoopEdgeWeight});
+
+  std::unordered_map<image_t, Rigid3d> poses = poses_old;
+  const PoseGraphSummary pg =
+      OptimizeSE3PoseGraph(PoseGraphOptions(), edges, fixed_ids, &poses);
+  if (!pg.success) {
+    LOG(WARNING) << "OnlineLoopCloser: CorrectLoop pose graph failed "
+                 << current_id << "-" << loop_id << " nodes=" << pg.num_nodes
+                 << " edges=" << pg.num_edges;
+    return false;
+  }
+  const Rigid3d& cur_after = poses.at(current_id);
+  const double cur_vs_pnp_m = (cur_after.TgtOriginInSrc() -
+                               loop_pair.loop_cam_from_world.TgtOriginInSrc())
+                                  .norm();
+  const double cur_vs_pnp_deg = RotationDiffDeg(
+      cur_after.rotation(), loop_pair.loop_cam_from_world.rotation());
+
+  // Stage B: move each point with its reference (first observing) frame, so
+  // points first seen by the old map keep their position.
+  std::unordered_set<point3D_t> visited;
+  size_t num_points_moved = 0;
+  size_t num_points_kept = 0;
+  for (const image_t id : variable_ids) {
+    for (const Point2D& point2D : reconstruction.Image(id).Points2D()) {
       if (!point2D.HasPoint3D() ||
-          !reconstruction.ExistsPoint3D(point2D.point3D_id)) {
+          !reconstruction.ExistsPoint3D(point2D.point3D_id) ||
+          !visited.insert(point2D.point3D_id).second) {
         continue;
       }
-      const point3D_t point3D_id = point2D.point3D_id;
-      if (!corrected_points.insert(point3D_id).second) {
+      Point3D& point3D = reconstruction.Point3D(point2D.point3D_id);
+      image_t ref_id = kInvalidImageId;
+      for (const TrackElement& el : point3D.track.Elements()) {
+        if (reconstruction.ExistsImage(el.image_id) &&
+            reconstruction.Image(el.image_id).HasPose() &&
+            (ref_id == kInvalidImageId || el.image_id < ref_id)) {
+          ref_id = el.image_id;
+        }
+      }
+      if (variable_set.count(ref_id) == 0) {
+        ++num_points_kept;
         continue;
       }
-      Point3D& point3D = reconstruction.Point3D(point3D_id);
-      point3D.xyz = Swi_corr * (Siw_old * point3D.xyz);
-      ++num_points_corrected;
+      point3D.xyz =
+          Inverse(poses.at(ref_id)) * (poses_old.at(ref_id) * point3D.xyz);
+      ++num_points_moved;
     }
-
-    if (SetImagePose(image, Sim3ToSE3(Siw_corr))) {
+  }
+  size_t num_poses_corrected = 0;
+  for (const image_t id : variable_ids) {
+    if (SetImagePose(reconstruction.Image(id), poses.at(id))) {
       ++num_poses_corrected;
     }
   }
 
-  // Stage C1: fuse Sim3 inlier 3D–3D pairs.
+  // Loop-side map points with one reference observation each (descriptor).
+  std::unordered_map<point3D_t, std::pair<image_t, point2D_t>> loop_points;
+  for (const image_t id : anchor_set) {
+    if (!reconstruction.ExistsImage(id)) {
+      continue;
+    }
+    const Image& image = reconstruction.Image(id);
+    for (point2D_t idx = 0; idx < image.NumPoints2D(); ++idx) {
+      const Point2D& point2D = image.Point2D(idx);
+      if (point2D.HasPoint3D() &&
+          reconstruction.ExistsPoint3D(point2D.point3D_id)) {
+        loop_points.emplace(point2D.point3D_id, std::make_pair(id, idx));
+      }
+    }
+  }
+
+  // Overlap window: corrected frames onto which enough of the loop-side map
+  // projects, strongest first, capped by max_correct_connected.
+  std::vector<std::pair<size_t, image_t>> overlap;
+  for (const image_t id : variable_ids) {
+    const Image& image = reconstruction.Image(id);
+    if (!image.HasCameraPtr()) {
+      continue;
+    }
+    const Camera& camera = *image.CameraPtr();
+    const Rigid3d cam_from_world = image.CamFromWorld();
+    size_t num_visible = 0;
+    for (const auto& [loop_pid, ref] : loop_points) {
+      const auto proj = ProjectCam(
+          camera, cam_from_world * reconstruction.Point3D(loop_pid).xyz);
+      if (proj && InsideImage(camera, *proj)) {
+        ++num_visible;
+      }
+    }
+    if (id == current_id || num_visible >= kMinOverlapProjections) {
+      overlap.emplace_back(id == current_id ? loop_points.size() + 1
+                                            : num_visible,
+                           id);
+    }
+  }
+  std::sort(overlap.begin(), overlap.end(), std::greater<>());
+  std::vector<image_t> connected;
+  for (const auto& [num_visible, id] : overlap) {
+    if (static_cast<int>(connected.size()) >=
+        std::max(1, options_.max_correct_connected)) {
+      break;
+    }
+    connected.push_back(id);
+  }
+
+  std::unordered_map<image_t, FeatureDescriptors> descriptors;
+  try {
+    DatabaseSession session(database_path_);
+    const auto Load = [&](const image_t id) {
+      if (descriptors.count(id) == 0 && session->ExistsDescriptors(id)) {
+        descriptors.emplace(id, session->ReadDescriptors(id));
+      }
+    };
+    for (const image_t id : anchor_set) {
+      Load(id);
+    }
+    for (const image_t id : connected) {
+      Load(id);
+    }
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "OnlineLoopCloser: CorrectLoop failed to read descriptors: "
+                 << e.what();
+  }
+
   std::unordered_map<point3D_t, point3D_t> remap;
   const auto Resolve = [&](point3D_t id) {
     while (true) {
@@ -1693,133 +1576,202 @@ bool OnlineLoopCloser::CorrectLocalLoop(Reconstruction& reconstruction,
       id = it->second;
     }
   };
-  size_t num_fused_direct = 0;
-  for (const auto& [cur_id_raw, loop_id_raw] : matched_point3Ds) {
-    const point3D_t cur_id = Resolve(cur_id_raw);
-    const point3D_t loop_pid = Resolve(loop_id_raw);
-    if (cur_id == loop_pid || !reconstruction.ExistsPoint3D(cur_id) ||
-        !reconstruction.ExistsPoint3D(loop_pid)) {
-      continue;
-    }
+  // Merge into the loop-side point and keep its (old map) position.
+  const auto MergeKeepLoop = [&](const point3D_t cur_pid,
+                                 const point3D_t loop_pid) {
+    const Eigen::Vector3d loop_xyz = reconstruction.Point3D(loop_pid).xyz;
     try {
-      const point3D_t merged =
-          obs_manager->MergePoints3D(cur_id, loop_pid);
-      remap[cur_id] = merged;
+      const point3D_t merged = obs_manager->MergePoints3D(cur_pid, loop_pid);
+      reconstruction.Point3D(merged).xyz = loop_xyz;
+      remap[cur_pid] = merged;
       remap[loop_pid] = merged;
-      ++num_fused_direct;
+      return true;
     } catch (const std::exception& e) {
-      LOG(WARNING) << "OnlineLoopCloser: merge " << cur_id << "+" << loop_pid
+      LOG(WARNING) << "OnlineLoopCloser: merge " << cur_pid << "+" << loop_pid
                    << " failed: " << e.what();
+      return false;
     }
-  }
+  };
+  const auto Attach = [&](const point3D_t loop_pid,
+                          const image_t image_id,
+                          const point2D_t idx) {
+    try {
+      obs_manager->AddObservation(loop_pid, TrackElement(image_id, idx));
+      return true;
+    } catch (const std::exception& e) {
+      LOG(WARNING) << "OnlineLoopCloser: attach point " << loop_pid
+                   << " to image " << image_id << " failed: " << e.what();
+      return false;
+    }
+  };
 
-  // Stage C2: SearchAndFuse — project loop-neighborhood points into the
-  // corrected current window and merge / attach observations.
-  std::unordered_set<point3D_t> loop_points;
-  const std::unordered_set<image_t> loop_group =
-      CovisibilityGroup(loop_id, reconstruction);
-  for (const image_t id : loop_group) {
-    if (!reconstruction.ExistsImage(id)) {
-      continue;
-    }
-    for (const Point2D& point2D : reconstruction.Image(id).Points2D()) {
-      if (point2D.HasPoint3D() &&
-          reconstruction.ExistsPoint3D(point2D.point3D_id)) {
-        loop_points.insert(Resolve(point2D.point3D_id));
+  // Stage C1: PnP inliers of the current frame.
+  size_t num_fused_direct = 0;
+  size_t num_attached_direct = 0;
+  {
+    const Image& current = reconstruction.Image(current_id);
+    for (const auto& [idx, loop_pid_raw] : loop_pair.loop_observations) {
+      const point3D_t loop_pid = Resolve(loop_pid_raw);
+      if (idx >= current.NumPoints2D() ||
+          !reconstruction.ExistsPoint3D(loop_pid)) {
+        continue;
+      }
+      const Point2D& point2D = current.Point2D(idx);
+      if (point2D.HasPoint3D()) {
+        if (point2D.point3D_id != loop_pid &&
+            MergeKeepLoop(point2D.point3D_id, loop_pid)) {
+          ++num_fused_direct;
+        }
+      } else if (!current.HasPoint3D(loop_pid) &&
+                 Attach(loop_pid, current_id, idx)) {
+        ++num_attached_direct;
       }
     }
   }
 
-  const OnlineSim3SolverOptions sim3_defaults;
+  // Stage C2: project the loop-side map into the overlap window; accept the
+  // descriptor-closest keypoint inside the fuse radius.
   const double fuse_radius_sq =
-      sim3_defaults.fuse_radius_px * sim3_defaults.fuse_radius_px;
+      options_.fuse_radius_px * options_.fuse_radius_px;
   size_t num_fused_proj = 0;
-  size_t num_attached = 0;
-  std::unordered_set<point2D_t> empty_used;
+  size_t num_attached_proj = 0;
+  size_t num_rejected_dist = 0;
+  size_t num_rejected_desc = 0;
   for (const image_t id : connected) {
     Image& image = reconstruction.Image(id);
-    if (!image.HasPose() || !image.HasCameraPtr()) {
+    const auto desc_it = descriptors.find(id);
+    if (!image.HasPose() || !image.HasCameraPtr() ||
+        desc_it == descriptors.end()) {
       continue;
     }
     const Camera& camera = *image.CameraPtr();
     const Rigid3d cam_from_world = image.CamFromWorld();
-
-    for (point3D_t loop_pid_raw : loop_points) {
+    const double cell = std::max(1.0, options_.fuse_radius_px);
+    const int grid_w = static_cast<int>(camera.width / cell) + 1;
+    const int grid_h = static_cast<int>(camera.height / cell) + 1;
+    std::vector<std::vector<point2D_t>> grid(grid_w * grid_h);
+    for (point2D_t i = 0; i < image.NumPoints2D(); ++i) {
+      const Eigen::Vector2d& xy = image.Point2D(i).xy;
+      const int gx = std::clamp(static_cast<int>(xy.x() / cell), 0, grid_w - 1);
+      const int gy = std::clamp(static_cast<int>(xy.y() / cell), 0, grid_h - 1);
+      grid[gy * grid_w + gx].push_back(i);
+    }
+    std::unordered_set<point2D_t> used;
+    for (const auto& [loop_pid_raw, ref] : loop_points) {
       const point3D_t loop_pid = Resolve(loop_pid_raw);
-      if (!reconstruction.ExistsPoint3D(loop_pid)) {
+      const auto ref_desc_it = descriptors.find(ref.first);
+      if (!reconstruction.ExistsPoint3D(loop_pid) ||
+          image.HasPoint3D(loop_pid) || ref_desc_it == descriptors.end()) {
         continue;
       }
-      if (image.HasPoint3D(loop_pid)) {
+      const Eigen::Vector3d loop_xyz = reconstruction.Point3D(loop_pid).xyz;
+      const auto proj = ProjectCam(camera, cam_from_world * loop_xyz);
+      if (!proj || !InsideImage(camera, *proj)) {
         continue;
       }
-      const Eigen::Vector3d xyz_cam =
-          cam_from_world * reconstruction.Point3D(loop_pid).xyz;
-      const auto proj = ProjectCam(camera, xyz_cam);
-      if (!proj) {
-        continue;
-      }
+      float best_l2 = kLoopDescMaxL2Sq;
       point2D_t best_idx = kInvalidPoint2DIdx;
-      if (!FindNearestKeypoint(
-              image, *proj, fuse_radius_sq, empty_used, &best_idx)) {
+      bool any_in_radius = false;
+      const int pgx = static_cast<int>(proj->x() / cell);
+      const int pgy = static_cast<int>(proj->y() / cell);
+      for (int gy = std::max(0, pgy - 1); gy <= std::min(grid_h - 1, pgy + 1);
+           ++gy) {
+        for (int gx = std::max(0, pgx - 1); gx <= std::min(grid_w - 1, pgx + 1);
+             ++gx) {
+          for (const point2D_t i : grid[gy * grid_w + gx]) {
+            if (used.count(i) > 0 ||
+                (image.Point2D(i).xy - *proj).squaredNorm() >= fuse_radius_sq) {
+              continue;
+            }
+            any_in_radius = true;
+            const float l2 = DescriptorL2Sq(
+                ref_desc_it->second, ref.second, desc_it->second, i);
+            if (l2 < best_l2) {
+              best_l2 = l2;
+              best_idx = i;
+            }
+          }
+        }
+      }
+      if (best_idx == kInvalidPoint2DIdx) {
+        num_rejected_desc += any_in_radius ? 1 : 0;
         continue;
       }
-      Point2D& point2D = image.Point2D(best_idx);
+      const Point2D& point2D = image.Point2D(best_idx);
       if (point2D.HasPoint3D()) {
-        const point3D_t cur_pid = Resolve(point2D.point3D_id);
-        if (cur_pid == loop_pid || !reconstruction.ExistsPoint3D(cur_pid) ||
-            !reconstruction.ExistsPoint3D(loop_pid)) {
+        const point3D_t cur_pid = point2D.point3D_id;
+        if (cur_pid == loop_pid || !reconstruction.ExistsPoint3D(cur_pid)) {
           continue;
         }
-        try {
-          const point3D_t merged =
-              obs_manager->MergePoints3D(cur_pid, loop_pid);
-          remap[cur_pid] = merged;
-          remap[loop_pid] = merged;
+        if ((reconstruction.Point3D(cur_pid).xyz - loop_xyz).norm() >
+            options_.fuse_max_point_distance) {
+          ++num_rejected_dist;
+          continue;
+        }
+        if (MergeKeepLoop(cur_pid, loop_pid)) {
+          used.insert(best_idx);
           ++num_fused_proj;
-        } catch (const std::exception& e) {
-          LOG(WARNING) << "OnlineLoopCloser: fuse-merge " << cur_pid << "+"
-                       << loop_pid << " failed: " << e.what();
         }
-      } else {
-        try {
-          obs_manager->AddObservation(loop_pid,
-                                      TrackElement(id, best_idx));
-          ++num_attached;
-        } catch (const std::exception& e) {
-          LOG(WARNING) << "OnlineLoopCloser: attach point " << loop_pid
-                       << " to image " << id << " failed: " << e.what();
-        }
+      } else if (Attach(loop_pid, id, best_idx)) {
+        used.insert(best_idx);
+        ++num_attached_proj;
       }
     }
   }
 
-  LOG(INFO) << "OnlineLoopCloser: CorrectLocalLoop " << current_id << "-"
-            << loop_id << " connected=" << connected.size()
+  last_correction_.current_id = current_id;
+  last_correction_.loop_id = loop_id;
+  // Every pose-graph-moved frame is refined and filtered; `connected` only
+  // limits fusion.
+  last_correction_.variable_ids = variable_ids;
+  last_correction_.anchor_ids = loop_map_ids;
+
+  LOG(INFO) << "OnlineLoopCloser: CorrectLoop " << current_id << "-" << loop_id
+            << " variable=[" << variable_ids.front() << ".."
+            << variable_ids.back() << "](" << variable_ids.size() << ")"
+            << " boundary=" << boundary_id << " anchor_max=" << anchor_max
+            << " edges=" << pg.num_edges << " covis_edges=" << num_covis_edges
+            << " old_covis_edges=" << num_old_covis_edges
+            << " fixed_nodes=" << fixed_ids.size()
+            << " cost=" << pg.initial_cost << "->" << pg.final_cost
+            << " cur_vs_pnp_m=" << cur_vs_pnp_m
+            << " cur_vs_pnp_deg=" << cur_vs_pnp_deg
             << " poses=" << num_poses_corrected
-            << " points=" << num_points_corrected
+            << " points_moved=" << num_points_moved
+            << " points_kept=" << num_points_kept
             << " fuse_direct=" << num_fused_direct
+            << " attach_direct=" << num_attached_direct
             << " fuse_proj=" << num_fused_proj
-            << " attached=" << num_attached
-            << " scale=" << loop_from_current.scale()
-            << " t=[" << loop_from_current.translation().transpose() << "]";
+            << " attach_proj=" << num_attached_proj
+            << " fuse_rejected_dist=" << num_rejected_dist
+            << " fuse_rejected_desc=" << num_rejected_desc
+            << " window=" << connected.size() << " ["
+            << *std::min_element(connected.begin(), connected.end()) << ".."
+            << *std::max_element(connected.begin(), connected.end()) << "]";
   return num_poses_corrected > 0;
 }
 
-image_t OnlineLoopCloser::MinCovisibilityImageId(
-    const image_t image_id, const Reconstruction& reconstruction) const {
-  image_t min_id = image_id;
-  const auto shared = CountCovisibilityPoints(image_id, reconstruction);
-  for (const auto& [other_id, count] : shared) {
-    if (count < options_.min_covisibility_points) {
+std::vector<image_t> OnlineLoopCloser::LoopMapImages(
+    const image_t candidate_id,
+    const image_t current_id,
+    const Reconstruction& reconstruction) const {
+  std::vector<image_t> ids = {candidate_id};
+  const std::unordered_set<image_t> group =
+      CovisibilityGroup(candidate_id, reconstruction);
+  const std::unordered_set<image_t> current_group =
+      CovisibilityGroup(current_id, reconstruction);
+  for (const image_t id : RankedCovisible(candidate_id, reconstruction)) {
+    if (ids.size() >= kMaxLoopMapImages) {
+      break;
+    }
+    if (id == current_id || group.count(id) == 0 ||
+        current_group.count(id) > 0 || !reconstruction.ExistsImage(id) ||
+        !reconstruction.Image(id).HasPose()) {
       continue;
     }
-    if (!reconstruction.ExistsImage(other_id) ||
-        !reconstruction.Image(other_id).HasPose()) {
-      continue;
-    }
-    min_id = std::min(min_id, other_id);
+    ids.push_back(id);
   }
-  return min_id;
+  return ids;
 }
 
 std::unordered_map<image_t, int> OnlineLoopCloser::CountCovisibilityPoints(
