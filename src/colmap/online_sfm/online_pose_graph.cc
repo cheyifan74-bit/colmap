@@ -113,7 +113,9 @@ PoseGraphSummary OptimizeSE3PoseGraph(
   }
 
   ceres::Solver::Options solver_options;
-  solver_options.linear_solver_type = ceres::DENSE_NORMAL_CHOLESKY;
+  // Pose-only graph. Dense Cholesky is cubic in the number of free poses and
+  // stalls loop correction once that set reaches a few hundred frames.
+  solver_options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
   solver_options.max_num_iterations = options.max_num_iterations;
   solver_options.logging_type = ceres::LoggingType::SILENT;
   solver_options.minimizer_progress_to_stdout = false;
