@@ -239,6 +239,7 @@ bool OnlineIncrementalMapper::Process(
   if (extracted.keypoints && extracted.descriptors) {
     matcher_->CacheFeatures(
         image_id, extracted.keypoints, extracted.descriptors);
+    mapper_->CacheDescriptors(image_id, extracted.descriptors);
   }
 
   if (!IngestImage(image_id)) {
@@ -268,6 +269,10 @@ bool OnlineIncrementalMapper::Process(
         matcher_.get(),
         extracted.bitmap.IsEmpty() ? nullptr : &extracted.bitmap);
     if (corrected) {
+      const OnlineLoopCorrection& correction = loop_closer_->LastCorrection();
+      mapper_->AdjustLoopBundle(correction.variable_ids, correction.anchor_ids);
+      loop_closer_->FuseAfterLoopBA(mapper_->GetReconstruction(),
+                                    mapper_->GetObservationManager());
       mapper_->WriteSparse();
     }
   }

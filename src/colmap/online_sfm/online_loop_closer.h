@@ -29,7 +29,7 @@
 
 #pragma once
 
-#include "colmap/geometry/sim3.h"
+#include "colmap/geometry/rigid3.h"
 #include "colmap/online_sfm/online_feature_matcher.h"
 #include "colmap/scene/database_cache.h"
 #include "colmap/scene/reconstruction.h"
@@ -58,6 +58,9 @@ struct OnlineLoopCloserOptions {
   bool mixvpr_use_gpu = true;
   std::string mixvpr_gpu_index = "-1";
   int cooldown_num_images = 10;
+  // Candidates must be at least this many keyframes older than the query, so
+  // temporal neighbours with broken covisibility are never loop candidates.
+  int min_frame_gap = 20;
   // Camera-center radius (meters). <=0 disables the distance gate.
   double max_distance = 10.0;
   // Optical-axis angle (degrees). <=0 disables the heading gate.
@@ -67,13 +70,29 @@ struct OnlineLoopCloserOptions {
   int topk = 5;
   int min_covisibility_points = 15;
   int min_num_matches = 20;
+  // PnP inliers after guided projection matching.
   int min_num_verified_matches = 40;
+  // 2D (current) – 3D (loop map) correspondences required to run PnP.
   int min_num_3d_correspondences = 20;
+  // PnP RANSAC inliers before guided matching.
   int min_num_3d_inliers = 20;
   bool correct_local = true;
+  // Fusion / loop-BA window: corrected frames that see the loop-side map.
   int max_correct_connected = 20;
-  // false: estimate Sim3 scale (7DoF); true: fix s=1 (SE3 / stereo ORB).
-  bool fix_scale = false;
+  // Loop PnP reprojection threshold (pixels).
+  double pnp_max_error = 3.0;
+  // Guided projection search radius when growing PnP matches (pixels).
+  double guided_radius_px = 7.5;
+  // Loop rotation (PnP) vs essential-matrix rotation; <=0 disables.
+  double max_rot_vs_essential_deg = 3.0;
+  // Reject loops whose correction of the current pose is larger than this.
+  double max_correction_m = 3.0;
+  double max_correction_deg = 20.0;
+  // Covisibility edges in the pose graph need at least this many shared points.
+  int pose_graph_min_covis = 50;
+  // Projection fusion after correction.
+  double fuse_radius_px = 6.0;
+  double fuse_max_point_distance = 0.2;
 };
 
 struct OnlineLoopPair {
@@ -84,10 +103,26 @@ struct OnlineLoopPair {
   size_t num_inliers = 0;
   size_t num_3d_correspondences = 0;
   size_t num_3d_inliers = 0;
-  bool used_sim3 = false;
-  double scale = 1.0;
-  Sim3d cand_from_cur;
-  std::vector<std::pair<point3D_t, point3D_t>> matched_point3Ds;
+  bool has_loop_pose = false;
+  // Current-frame pose from PnP against the loop-side map.
+  Rigid3d loop_cam_from_world;
+  double correction_m = 0.0;
+  double correction_deg = 0.0;
+  double rot_vs_essential_deg = -1.0;
+  // PnP inliers: (current point2D idx, loop-side point3D id).
+  std::vector<std::pair<point2D_t, point3D_t>> loop_observations;
+};
+
+// Last successful loop correction, consumed by the mapper's anchored BA.
+struct OnlineLoopCorrection {
+  image_t current_id = kInvalidImageId;
+  image_t loop_id = kInvalidImageId;
+  std::vector<image_t> variable_ids;
+  std::vector<image_t> anchor_ids;
+  // Frames the loop-side map was projected into. Post-BA fusion reuses them.
+  std::vector<image_t> fusion_ids;
+  // Images whose 3D points are the loop-side map for that projection.
+  std::vector<image_t> loop_point_image_ids;
 };
 
 class MixVprEncoder;
@@ -114,6 +149,14 @@ class OnlineLoopCloser {
   const std::vector<OnlineLoopPair>& ConfirmedLoops() const {
     return confirmed_loops_;
   }
+  const OnlineLoopCorrection& LastCorrection() const {
+    return last_correction_;
+  }
+
+  // Project the loop-side map into the fusion window again, after loop BA has
+  // moved poses and points, and merge pairs now within the fuse distance.
+  void FuseAfterLoopBA(Reconstruction& reconstruction,
+                       ObservationManager* obs_manager);
 
  private:
   bool InitMixVprModel();
@@ -130,12 +173,13 @@ class OnlineLoopCloser {
                        const Reconstruction& reconstruction,
                        OnlineFeatureMatcher* matcher,
                        OnlineLoopPair* loop_pair);
-  bool CorrectLocalLoop(Reconstruction& reconstruction,
-                        ObservationManager* obs_manager,
-                        const OnlineLoopPair& loop_pair);
-  // Smallest strong-covisible image id (incl. self). Older map side → smaller.
-  image_t MinCovisibilityImageId(image_t image_id,
-                                 const Reconstruction& reconstruction) const;
+  bool CorrectLoop(Reconstruction& reconstruction,
+                   ObservationManager* obs_manager,
+                   const OnlineLoopPair& loop_pair);
+  // Candidate + its strongest covisibles (the old map PnP is solved against).
+  std::vector<image_t> LoopMapImages(image_t candidate_id,
+                                     image_t current_id,
+                                     const Reconstruction& reconstruction) const;
   std::unordered_map<image_t, int> CountCovisibilityPoints(
       image_t image_id, const Reconstruction& reconstruction) const;
   std::unordered_set<image_t> CovisibilityGroup(
@@ -157,6 +201,7 @@ class OnlineLoopCloser {
   std::unique_ptr<MixVprEncoder> mixvpr_;
   std::unique_ptr<TimingStats> timing_;
   std::vector<OnlineLoopPair> confirmed_loops_;
+  OnlineLoopCorrection last_correction_;
   image_t last_loop_image_id_ = kInvalidImageId;
 };
 

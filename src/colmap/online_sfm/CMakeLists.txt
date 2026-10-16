@@ -38,7 +38,7 @@ COLMAP_ADD_LIBRARY(
         online_incremental_mapper.h online_incremental_mapper.cc
         online_loop_closer.h online_loop_closer.cc
         online_mapper.h online_mapper.cc
-        online_sim3_solver.h online_sim3_solver.cc
+        online_pose_graph.h online_pose_graph.cc
         timing_stats.h timing_stats.cc
     PUBLIC_LINK_LIBS
         colmap_sfm

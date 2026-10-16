@@ -30,11 +30,13 @@
 #pragma once
 
 #include "colmap/estimators/bundle_adjustment.h"
+#include "colmap/feature/types.h"
 #include "colmap/geometry/rigid3.h"
 #include "colmap/scene/database_cache.h"
 #include "colmap/scene/reconstruction.h"
 #include "colmap/sfm/incremental_triangulator.h"
 #include "colmap/sfm/observation_manager.h"
+#include "colmap/util/hash_containers.h"
 #include "colmap/util/types.h"
 
 #include <memory>
@@ -42,6 +44,9 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include <ceres/loss_function.h>
+#include <ceres/problem.h>
 
 namespace colmap {
 
@@ -52,19 +57,33 @@ struct OnlineMapperOptions {
   double abs_pose_min_inlier_ratio = 0.25;
   int ba_local_num_images = 0;
   int ba_min_covisibility_points = 15;
-  int ba_min_first_level_for_pose = 3;
-  double ba_max_pose_center_jump = 0.5;
-  double ba_max_pose_angle_deg = 15.0;
   double filter_max_reproj_error = 1.0;
   double filter_min_tri_angle = 1.5;
+  // Local-map projection matching: points seen by the last N registered
+  // frames are projected into the current frame and matched by descriptor.
+  // Before registration the VIO-predicted pose is used with
+  // `local_map_search_radius_px`; after registration the refined pose with
+  // `local_map_refine_radius_px`. <= 0 images disables.
+  int local_map_num_images = 15;
+  double local_map_search_radius_px = 15.0;
+  double local_map_refine_radius_px = 4.0;
+  // SIFT L2 distance on unit-normalized descriptors.
+  double local_map_max_desc_distance = 0.7;
+  double local_map_max_ratio = 0.9;
+  
+  double ba_vio_prior_rot_sigma_deg = 1.0;
+  double ba_vio_prior_trans_sigma_m = 0.02;
+  double ba_vio_prior_trans_sigma_ratio = 0.03;
+  int ba_vio_prior_max_gap = 5;
+  // Local BA windows smaller than this (current + covisible frames) are padded
+  // with up to `ba_temporal_window_images` most recent registered frames.
+  int ba_min_window_images = 4;
+  int ba_temporal_window_images = 5;
   IncrementalTriangulator::Options triangulation;
 
   OnlineMapperOptions() { triangulation.ignore_two_view_tracks = false; }
 };
 
-// Online monocular mapping: VIO-metric init, P3P with VIO fallback,
-// IncrementalTriangulator, and a simplified local BA (fixed
-// intrinsics).
 class OnlineMapper {
  public:
   OnlineMapper(std::shared_ptr<DatabaseCache> database_cache,
@@ -81,6 +100,10 @@ class OnlineMapper {
 
   void NotifyNewImagePair(image_t image_id1, image_t image_id2);
 
+  // Descriptors in keypoint order, used by local-map projection matching.
+  void CacheDescriptors(image_t image_id,
+                        std::shared_ptr<const FeatureDescriptors> descriptors);
+
 
   bool MappingCurrentImage(image_t image_id,
                            const std::optional<Rigid3d>& vio_prior);
@@ -90,9 +113,13 @@ class OnlineMapper {
   Reconstruction& GetReconstruction() { return *reconstruction_; }
   ObservationManager* GetObservationManager() { return obs_manager_.get(); }
   void WriteSparse() const;
+  // Local BA after loop correction: `variable_ids` refined, `anchor_ids`
+  // (loop-side old map) held constant.
+  void AdjustLoopBundle(const std::vector<image_t>& variable_ids,
+                        const std::vector<image_t>& anchor_ids);
 
  private:
-  struct P3PRegisterResult {
+  struct PriorRegisterResult {
     bool success = false;
     size_t num_inliers = 0;
     Rigid3d cam_from_world;
@@ -101,7 +128,24 @@ class OnlineMapper {
   bool InitReconstruction();
   bool RegisterImageWithKnownPose(image_t image_id,
                                   const Rigid3d& cam_from_world);
-  P3PRegisterResult RegisterNextImageP3P(image_t image_id);
+  PriorRegisterResult RegisterNextImageWithPrior(image_t image_id);
+  struct ProjectionMatch {
+    point2D_t point2D_idx = kInvalidPoint2DIdx;
+    point3D_t point3D_id = kInvalidPoint3DId;
+  };
+  std::vector<ProjectionMatch> SearchLocalMapByProjection(
+      image_t image_id,
+      const Rigid3d& cam_from_world,
+      double radius_px,
+      const FlatHashSet<point2D_t>& skip_points2D,
+      const FlatHashSet<point3D_t>& skip_points3D) const;
+  // After registration: attach local-map points to unassociated keypoints.
+  size_t ExtendTracksByProjection(image_t image_id, const char* stage);
+  size_t AddVioPriorsToLocalBundle(const std::vector<image_t>& image_ids,
+                                   Reconstruction& reconstruction,
+                                   ceres::Problem* problem,
+                                   ceres::LossFunction* loss) const;
+  Rigid3d MapFrameCamFromWorld(image_t image_id, const Rigid3d& vio_prior) const;
   bool RegisterWithRelativeVio(image_t image_id, const Rigid3d& vio_prior);
   image_t FindLastRegisteredWithPrior(image_t image_id) const;
   bool TryInitialize(image_t image_id);
@@ -131,6 +175,8 @@ class OnlineMapper {
   std::shared_ptr<ObservationManager> obs_manager_;
   std::shared_ptr<IncrementalTriangulator> triangulator_;
   std::unordered_map<image_t, Rigid3d> pose_priors_;
+  std::unordered_map<image_t, std::shared_ptr<const FeatureDescriptors>>
+      descriptors_;
   bool initialized_ = false;
 };
 
