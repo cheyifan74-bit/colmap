@@ -171,13 +171,24 @@ bool OnlineIncrementalMapper::IngestTwoViewGeometries(const image_t image_id) {
   if (!database_cache_->ExistsImage(image_id) || !database_cache_->CorrespondenceGraph()) {
     return true;
   }
+  if (!matcher_) {
+    return true;
+  }
+
+  // Only check partners from the latest MatchAndWrite / MatchSpecificPairs.
+  // Scanning database_cache_->Images() would be O(N) ExistsTwoViewGeometry
+  // queries per frame while useful pairs stay ~O(match candidates).
+  const std::vector<image_t>& partner_ids = matcher_->LastCandidateIds();
+  if (partner_ids.empty()) {
+    return true;
+  }
 
   try {
     DatabaseSession session(database_path_);
     auto graph = database_cache_->CorrespondenceGraph();
     const int min_inliers = matching_options_.geometry.min_num_inliers;
-    for (const auto& [prev_id, image] : database_cache_->Images()) {
-      (void)image;
+    size_t num_ingested = 0;
+    for (const image_t prev_id : partner_ids) {
       if (prev_id == image_id) {
         continue;
       }
@@ -199,8 +210,11 @@ bool OnlineIncrementalMapper::IngestTwoViewGeometries(const image_t image_id) {
         continue;
       }
       graph->AddTwoViewGeometry(prev_id, image_id, std::move(geometry));
-      // mapper_->NotifyNewImagePair(prev_id, image_id);
+      ++num_ingested;
     }
+    LOG(INFO) << "OnlineIncrementalMapper: ingest TVG image " << image_id
+              << " partners=" << partner_ids.size()
+              << " added=" << num_ingested;
   } catch (const std::exception& e) {
     LOG(ERROR) << "OnlineIncrementalMapper: ingest TVG for image " << image_id
                << " failed: " << e.what();

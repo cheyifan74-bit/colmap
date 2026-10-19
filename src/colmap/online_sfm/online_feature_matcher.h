@@ -102,6 +102,12 @@ class OnlineFeatureMatcher {
                           const std::vector<image_t>& other_ids,
                           const DatabaseCache& cache);
 
+  // Partners considered by the most recent MatchAndWrite / MatchSpecificPairs.
+  // Used by ingest to avoid scanning the full image list for TVG rows.
+  const std::vector<image_t>& LastCandidateIds() const {
+    return last_candidate_ids_;
+  }
+
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
  private:
@@ -138,6 +144,7 @@ class OnlineFeatureMatcher {
   std::unordered_map<image_t, Rigid3d> pose_priors_;
   std::vector<image_t> last_temporal_ids_;
   std::vector<image_t> last_spatial_ids_;
+  std::vector<image_t> last_candidate_ids_;
 };
 
 }  // namespace colmap
