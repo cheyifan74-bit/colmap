@@ -36,6 +36,7 @@
 #include "colmap/scene/reconstruction.h"
 #include "colmap/sfm/incremental_triangulator.h"
 #include "colmap/sfm/observation_manager.h"
+#include "colmap/online_sfm/timing_stats.h"
 #include "colmap/util/hash_containers.h"
 #include "colmap/util/types.h"
 
@@ -79,6 +80,9 @@ struct OnlineMapperOptions {
   // with up to `ba_temporal_window_images` most recent registered frames.
   int ba_min_window_images = 4;
   int ba_temporal_window_images = 5;
+  // Write the full sparse model every N successful map updates.
+  // <=1 writes every frame. Init, loop correction, and shutdown always flush.
+  int sparse_write_every_n = 10;
   IncrementalTriangulator::Options triangulation;
 
   OnlineMapperOptions() { triangulation.ignore_two_view_tracks = false; }
@@ -113,6 +117,8 @@ class OnlineMapper {
   Reconstruction& GetReconstruction() { return *reconstruction_; }
   ObservationManager* GetObservationManager() { return obs_manager_.get(); }
   void WriteSparse() const;
+  // Throttled write used on the per-keyframe path.
+  void MaybeWriteSparse();
   // Local BA after loop correction: `variable_ids` refined, `anchor_ids`
   // (loop-side old map) held constant.
   void AdjustLoopBundle(const std::vector<image_t>& variable_ids,
@@ -177,7 +183,10 @@ class OnlineMapper {
   std::unordered_map<image_t, Rigid3d> pose_priors_;
   std::unordered_map<image_t, std::shared_ptr<const FeatureDescriptors>>
       descriptors_;
+  std::unique_ptr<TimingStats> lba_timing_;
   bool initialized_ = false;
+  // Map updates since the last sparse flush. Reset by WriteSparse().
+  mutable int sparse_writes_since_flush_ = 0;
 };
 
 }  // namespace colmap

@@ -165,13 +165,12 @@ class OnlineLoopCloser {
       image_t image_id,
       const Eigen::VectorXf& query,
       const Reconstruction& reconstruction);
+  // Matches for every candidate are already written. Reads that pair and runs
+  // PnP only when the match count is high enough.
   bool VerifyCandidate(image_t image_id,
                        image_t candidate_id,
                        float retrieval_score,
-                       const std::string& query_abs_path,
-                       const DatabaseCache& cache,
                        const Reconstruction& reconstruction,
-                       OnlineFeatureMatcher* matcher,
                        OnlineLoopPair* loop_pair);
   bool CorrectLoop(Reconstruction& reconstruction,
                    ObservationManager* obs_manager,
@@ -186,15 +185,8 @@ class OnlineLoopCloser {
       image_t image_id, const Reconstruction& reconstruction) const;
   std::vector<image_t> RankedCovisible(
       image_t image_id, const Reconstruction& reconstruction) const;
-  void DumpMixVprTopkImages(
-      image_t query_id,
-      const std::string& query_abs_path,
-      const DatabaseCache& cache,
-      const std::vector<std::pair<image_t, float>>& ranked) const;
 
   std::string database_path_;
-  std::string mixvpr_topk_dir_;
-  std::string loop_verify_dir_;
   OnlineLoopCloserOptions options_;
   bool disabled_ = false;
   bool mixvpr_ready_ = false;

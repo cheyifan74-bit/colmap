@@ -39,6 +39,7 @@
 #include "colmap/scene/correspondence_graph.h"
 #include "colmap/scene/projection.h"
 #include "colmap/scene/track.h"
+#include "colmap/online_sfm/timing_stats.h"
 #include "colmap/util/hash_containers.h"
 #include "colmap/util/logging.h"
 
@@ -48,6 +49,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <ostream>
 #include <sstream>
 #include <utility>
@@ -68,7 +70,7 @@ BundleAdjustmentOptions MakeLocalBaOptions(const int min_track_length) {
     options.ceres->loss_function_type =
         CeresBundleAdjustmentOptions::LossFunctionType::SOFT_L1;
     options.ceres->loss_function_scale = 1.0;
-    options.ceres->solver_options.max_num_iterations = 25;
+    options.ceres->solver_options.max_num_iterations = 10;
     options.ceres->solver_options.logging_type = ceres::LoggingType::SILENT;
   }
   return options;
@@ -131,9 +133,29 @@ OnlineMapper::OnlineMapper(std::shared_ptr<DatabaseCache> database_cache,
     : database_cache_(std::move(database_cache)),
       sparse_path_(std::move(sparse_path)),
       options_(options),
-      reconstruction_(std::make_shared<Reconstruction>()) {}
+      reconstruction_(std::make_shared<Reconstruction>()) {
+  if (!sparse_path_.empty()) {
+    const std::filesystem::path timing_path =
+        std::filesystem::path(sparse_path_).parent_path() / "database" /
+        "lba_timing.txt";
+    lba_timing_ = std::make_unique<TimingStats>(
+        timing_path.string(),
+        "lba",
+        std::vector<std::string>{
+            "window", "variable", "residuals", "vio_priors"});
+    lba_timing_->AddMeta(
+        "ba_local_num_images",
+        std::to_string(options_.ba_local_num_images));
+    lba_timing_->AddMeta("max_num_iterations", "10");
+    lba_timing_->AddMeta("scope", "AdjustLocalBundle::Solve");
+  }
+}
 
-OnlineMapper::~OnlineMapper() = default;
+OnlineMapper::~OnlineMapper() {
+  if (sparse_writes_since_flush_ > 0) {
+    WriteSparse();
+  }
+}
 
 bool OnlineMapper::InitReconstruction() {
   if (obs_manager_ && triangulator_) {
@@ -1068,7 +1090,18 @@ void OnlineMapper::AdjustLocalBundle(const image_t image_id) {
   const size_t num_vio_priors = AddVioPriorsToLocalBundle(
       local_ids, *reconstruction_, bundle_adjuster->Problem().get(),
       prior_loss.get());
+  if (lba_timing_) {
+    lba_timing_->Start();
+  }
   const auto summary = bundle_adjuster->Solve();
+  if (lba_timing_) {
+    lba_timing_->Record(
+        std::to_string(image_id),
+        {std::to_string(local_ids.size()),
+         std::to_string(variable_ids.size()),
+         std::to_string(summary ? summary->num_residuals : 0),
+         std::to_string(num_vio_priors)});
+  }
   const bool usable = summary && summary->IsSolutionUsable();
   const Rigid3d pose_after = reconstruction_->Image(image_id).CamFromWorld();
   AppendLbaPoseRecord(image_id,
@@ -1189,12 +1222,25 @@ void OnlineMapper::WriteSparse() const {
     const std::filesystem::path out_dir(sparse_path_);
     std::filesystem::create_directories(out_dir);
     reconstruction_->Write(out_dir);
+    sparse_writes_since_flush_ = 0;
     LOG(INFO) << "OnlineMapper: wrote sparse to " << out_dir.string()
               << " frames=" << reconstruction_->NumRegFrames()
-              << " points3D=" << reconstruction_->NumPoints3D();
+              << " points3D=" << reconstruction_->NumPoints3D()
+              << " every_n=" << options_.sparse_write_every_n;
   } catch (const std::exception& e) {
     LOG(WARNING) << "OnlineMapper: failed to write sparse: " << e.what();
   }
+}
+
+void OnlineMapper::MaybeWriteSparse() {
+  const int every_n = std::max(options_.sparse_write_every_n, 1);
+  ++sparse_writes_since_flush_;
+  if (sparse_writes_since_flush_ < every_n) {
+    LOG(INFO) << "OnlineMapper: defer sparse write "
+              << sparse_writes_since_flush_ << "/" << every_n;
+    return;
+  }
+  WriteSparse();
 }
 
 bool OnlineMapper::MappingCurrentImage(const image_t image_id,
@@ -1212,7 +1258,7 @@ bool OnlineMapper::MappingCurrentImage(const image_t image_id,
   }
 
   if (reconstruction_->Image(image_id).HasPose()) {
-    WriteSparse();
+    MaybeWriteSparse();
     return true;
   }
 
@@ -1240,7 +1286,7 @@ bool OnlineMapper::MappingCurrentImage(const image_t image_id,
   TriangulateImage(image_id);
   MergeAndFilterPoints(image_id);
   AdjustLocalBundle(image_id);
-  WriteSparse();
+  MaybeWriteSparse();
   return true;
 }
 

@@ -31,6 +31,8 @@
 
 #include "colmap/util/timer.h"
 
+#include <fstream>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -43,6 +45,9 @@ namespace colmap {
 //   extract.Start();
 //   ... FeatureExtractor::Extract() ...
 //   extract.Record(std::to_string(image_id), {std::to_string(n), image_path});
+//
+// Record() is O(1): appends one TSV line and updates an incremental summary.
+// It does NOT rewrite the whole file (that previously dominated match timing).
 class TimingStats {
  public:
   TimingStats(std::string output_path,
@@ -66,27 +71,26 @@ class TimingStats {
               std::vector<std::string> extra = {});
 
  private:
-  struct Sample {
-    std::string id;
-    double elapsed_ms = 0.0;
-    std::vector<std::string> extra;
-  };
-
   struct Summary {
+    size_t count = 0;
     double avg_ms = 0.0;
-    double min_ms = 0.0;
+    double min_ms = std::numeric_limits<double>::infinity();
     double max_ms = 0.0;
+    double sum_ms = 0.0;
   };
 
-  Summary ComputeSummary() const;
-  void Write() const;
+  bool EnsureFileReady();
+  Summary GetSummary() const;
+  void WriteSummary() const;
 
   std::string output_path_;
   std::string name_;
   std::vector<std::string> extra_columns_;
   std::vector<std::pair<std::string, std::string>> meta_;
   Timer timer_;
-  std::vector<Sample> samples_;
+  Summary summary_;
+  std::ofstream file_;
+  bool header_written_ = false;
 };
 
 }  // namespace colmap

@@ -37,6 +37,7 @@
 #include "colmap/math/math.h"
 #include "colmap/online_sfm/timing_stats.h"
 #include "colmap/optim/loransac.h"
+#include "colmap/scene/database.h"
 #include "colmap/scene/database_session.h"
 #include "colmap/scene/two_view_geometry.h"
 #include "colmap/util/cache.h"
@@ -583,10 +584,10 @@ bool OnlineFeatureMatcher::MatchAndWrite(const image_t image_id,
                                            temporal_ids.end());
   last_spatial_ids_ = SelectSpatialImages(image_id, cache, temporal_set);
   const std::vector<image_t>& spatial_ids = last_spatial_ids_;
-  std::vector<image_t> previous_ids = temporal_ids;
-  previous_ids.insert(
-      previous_ids.end(), spatial_ids.begin(), spatial_ids.end());
-  if (previous_ids.empty()) {
+  last_candidate_ids_ = temporal_ids;
+  last_candidate_ids_.insert(
+      last_candidate_ids_.end(), spatial_ids.begin(), spatial_ids.end());
+  if (last_candidate_ids_.empty()) {
     LOG(INFO) << "OnlineFeatureMatcher: skip match, image " << image_id
               << " has no temporal/spatial candidates";
     return true;
@@ -594,14 +595,18 @@ bool OnlineFeatureMatcher::MatchAndWrite(const image_t image_id,
   LOG(INFO) << "OnlineFeatureMatcher: image " << image_id
             << " candidates temporal=" << temporal_ids.size()
             << " spatial=" << spatial_ids.size();
-  return MatchPairsAndWrite(
-      image_id, previous_ids, cache, temporal_set, /*rematch_weak=*/false);
+  return MatchPairsAndWrite(image_id,
+                            last_candidate_ids_,
+                            cache,
+                            temporal_set,
+                            /*rematch_weak=*/false);
 }
 
 bool OnlineFeatureMatcher::MatchSpecificPairs(
     const image_t image_id,
     const std::vector<image_t>& other_ids,
     const DatabaseCache& cache) {
+  last_candidate_ids_ = other_ids;
   if (other_ids.empty()) {
     return true;
   }
@@ -795,13 +800,23 @@ bool OnlineFeatureMatcher::MatchPairsAndWrite(
 
   try {
     DatabaseSession session(database_path_);
-    for (PairMatchResult& result : results) {
-      WritePairResult(*session,
-                      timing_.get(),
-                      image_id,
-                      std::move(result),
-                      options_.geometry.min_num_inliers);
+    // One SQLite transaction for all pairs: avoids per-pair autocommit/fsync
+    // (often ~10ms+ each) when writing Matches + TwoViewGeometry.
+    Timer write_timer;
+    write_timer.Start();
+    {
+      DatabaseTransaction transaction(session.get());
+      for (PairMatchResult& result : results) {
+        WritePairResult(*session,
+                        timing_.get(),
+                        image_id,
+                        std::move(result),
+                        options_.geometry.min_num_inliers);
+      }
     }
+    LOG(INFO) << "OnlineFeatureMatcher: wrote " << results.size()
+              << " pair(s) for image " << image_id << " in "
+              << write_timer.ElapsedMicroSeconds() / 1000.0 << "ms (1 txn)";
   } catch (const std::exception& e) {
     LOG(ERROR) << "OnlineFeatureMatcher: failed to write matches: "
                << e.what();

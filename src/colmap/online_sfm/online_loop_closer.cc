@@ -40,7 +40,6 @@
 #include "colmap/online_sfm/timing_stats.h"
 #include "colmap/scene/camera.h"
 #include "colmap/scene/database_session.h"
-#include "colmap/sensor/bitmap.h"
 #include "colmap/scene/track.h"
 #include "colmap/scene/two_view_geometry.h"
 #include "colmap/util/logging.h"
@@ -51,12 +50,10 @@
 #include <exception>
 #include <filesystem>
 #include <functional>
-#include <iomanip>
 #include <limits>
 #include <numeric>
 #include <optional>
 #include <sstream>
-#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -73,74 +70,6 @@ constexpr size_t kMinOverlapProjections = 50;
 // Newest track observations used as fusion descriptor references. The minimum
 // L2 among them is kept, same as local-map projection matching.
 constexpr size_t kMaxFuseRefDescriptors = 3;
-
-std::string ScoreForFilename(const float score) {
-  std::ostringstream oss;
-  oss << std::fixed << std::setprecision(4) << score;
-  std::string text = oss.str();
-  for (char& ch : text) {
-    if (ch == '.') {
-      ch = 'p';
-    } else if (ch == '-') {
-      ch = 'm';
-    } else if (ch == '+') {
-      ch = 'p';
-    }
-  }
-  return text;
-}
-
-std::filesystem::path KeyframeImagePath(const image_t image_id,
-                                        const std::string& query_abs_path,
-                                        const image_t query_id,
-                                        const DatabaseCache& cache,
-                                        const std::string& database_path) {
-  if (image_id == query_id && !query_abs_path.empty() &&
-      std::filesystem::exists(query_abs_path)) {
-    return query_abs_path;
-  }
-  if (!cache.ExistsImage(image_id)) {
-    return {};
-  }
-  const std::string& name = cache.Image(image_id).Name();
-  if (name.empty()) {
-    return {};
-  }
-  if (cache.ExistsImage(query_id) && !query_abs_path.empty()) {
-    const std::string& query_name = cache.Image(query_id).Name();
-    const std::string query_str =
-        std::filesystem::path(query_abs_path).generic_string();
-    if (!query_name.empty() && query_str.size() >= query_name.size() &&
-        query_str.compare(query_str.size() - query_name.size(),
-                          query_name.size(),
-                          query_name) == 0) {
-      const std::string root =
-          query_str.substr(0, query_str.size() - query_name.size());
-      return std::filesystem::path(root) / name;
-    }
-  }
-  const auto map_dir =
-      std::filesystem::path(database_path).parent_path().parent_path();
-  return map_dir / "images" / name;
-}
-
-bool CopyKeyframeImage(const std::filesystem::path& src,
-                       const std::filesystem::path& dst) {
-  if (src.empty() || !std::filesystem::exists(src)) {
-    return false;
-  }
-  std::error_code ec;
-  std::filesystem::copy_file(
-      src, dst, std::filesystem::copy_options::overwrite_existing, ec);
-  if (!ec) {
-    return true;
-  }
-  Bitmap bitmap;
-  if (!bitmap.Read(src, /*as_rgb=*/true)) {
-    return false;
-  }
-  return bitmap.Write(dst);
-}
 
 // Camera +Z in world. COLMAP x_cam = R x_world + t, so +Z_world = R^T e_z.
 Eigen::Vector3d OpticalAxisWorld(const Image& image) {
@@ -372,236 +301,6 @@ double RotationVsEssentialDeg(const TwoViewGeometry& geometry,
                          e_cur_from_cand.rotation());
 }
 
-void DrawPixel(Bitmap* image,
-               const int x,
-               const int y,
-               const BitmapColor<uint8_t>& color) {
-  if (image == nullptr) {
-    return;
-  }
-  image->SetPixel(x, y, color);
-}
-
-void DrawCross(Bitmap* image,
-               const int x,
-               const int y,
-               const int radius,
-               const BitmapColor<uint8_t>& color) {
-  for (int d = -radius; d <= radius; ++d) {
-    DrawPixel(image, x + d, y, color);
-    DrawPixel(image, x, y + d, color);
-  }
-}
-
-void DrawLine(Bitmap* image,
-              int x0,
-              int y0,
-              int x1,
-              int y1,
-              const BitmapColor<uint8_t>& color) {
-  if (image == nullptr) {
-    return;
-  }
-  const int dx = std::abs(x1 - x0);
-  const int dy = std::abs(y1 - y0);
-  const int sx = x0 < x1 ? 1 : -1;
-  const int sy = y0 < y1 ? 1 : -1;
-  int err = dx - dy;
-  while (true) {
-    DrawPixel(image, x0, y0, color);
-    if (x0 == x1 && y0 == y1) {
-      break;
-    }
-    const int e2 = 2 * err;
-    if (e2 > -dy) {
-      err -= dy;
-      x0 += sx;
-    }
-    if (e2 < dx) {
-      err += dx;
-      y0 += sy;
-    }
-  }
-}
-
-Bitmap MakeSideBySideMatchImage(
-    const Bitmap& left,
-    const Bitmap& right,
-    const std::vector<std::pair<Eigen::Vector2d, Eigen::Vector2d>>& pairs,
-    const BitmapColor<uint8_t>& color) {
-  const int width = left.Width() + right.Width();
-  const int height = std::max(left.Height(), right.Height());
-  Bitmap canvas(width, height, /*as_rgb=*/true);
-  canvas.Fill(BitmapColor<uint8_t>(0, 0, 0));
-
-  for (int y = 0; y < left.Height(); ++y) {
-    for (int x = 0; x < left.Width(); ++x) {
-      const auto px = left.GetPixel(x, y);
-      if (px) {
-        canvas.SetPixel(x, y, *px);
-      }
-    }
-  }
-  for (int y = 0; y < right.Height(); ++y) {
-    for (int x = 0; x < right.Width(); ++x) {
-      const auto px = right.GetPixel(x, y);
-      if (px) {
-        canvas.SetPixel(x + left.Width(), y, *px);
-      }
-    }
-  }
-
-  for (const auto& [xy_left, xy_right] : pairs) {
-    const int x0 = static_cast<int>(std::lround(xy_left.x()));
-    const int y0 = static_cast<int>(std::lround(xy_left.y()));
-    const int x1 =
-        static_cast<int>(std::lround(xy_right.x())) + left.Width();
-    const int y1 = static_cast<int>(std::lround(xy_right.y()));
-    DrawLine(&canvas, x0, y0, x1, y1, color);
-    DrawCross(&canvas, x0, y0, 3, color);
-    DrawCross(&canvas, x1, y1, 3, color);
-  }
-  return canvas;
-}
-
-bool LoadKeyframeBitmap(const image_t image_id,
-                        const std::string& query_abs_path,
-                        const image_t query_id,
-                        const DatabaseCache& cache,
-                        const std::string& database_path,
-                        Bitmap* out) {
-  if (out == nullptr) {
-    return false;
-  }
-  const auto path = KeyframeImagePath(
-      image_id, query_abs_path, query_id, cache, database_path);
-  if (path.empty()) {
-    return false;
-  }
-  return out->Read(path, /*as_rgb=*/true);
-}
-
-// Per query folder: query_XXXXXX/
-//   qA_cB_01_matches.png          feature / essential matches
-//   qA_cB_02_n3d.png              2D (current) – 3D (loop map) pairs
-//   qA_cB_03_pnp_inliers.png      PnP inliers after guided matching
-// 2D–3D pairs are drawn against the map point's projection into the candidate.
-void DumpLoopVerifyVisuals(
-    const std::string& loop_verify_dir,
-    const std::string& database_path,
-    const image_t query_id,
-    const image_t candidate_id,
-    const std::string& query_abs_path,
-    const DatabaseCache& cache,
-    const Reconstruction& reconstruction,
-    const FeatureMatches& matches,
-    const std::vector<LoopPnPCorr>& corrs,
-    const std::vector<char>& pnp_inliers) {
-  if (loop_verify_dir.empty()) {
-    return;
-  }
-  if (!reconstruction.ExistsImage(query_id) ||
-      !reconstruction.ExistsImage(candidate_id)) {
-    return;
-  }
-
-  std::ostringstream folder;
-  folder << "query_" << std::setfill('0') << std::setw(6) << query_id;
-  const std::filesystem::path query_dir =
-      std::filesystem::path(loop_verify_dir) / folder.str();
-  std::error_code ec;
-  std::filesystem::create_directories(query_dir, ec);
-  if (ec) {
-    LOG(WARNING) << "OnlineLoopCloser: failed to create " << query_dir.string()
-                 << " : " << ec.message();
-    return;
-  }
-
-  Bitmap bmp_query;
-  Bitmap bmp_cand;
-  if (!LoadKeyframeBitmap(query_id,
-                          query_abs_path,
-                          query_id,
-                          cache,
-                          database_path,
-                          &bmp_query) ||
-      !LoadKeyframeBitmap(candidate_id,
-                          query_abs_path,
-                          query_id,
-                          cache,
-                          database_path,
-                          &bmp_cand)) {
-    LOG(WARNING) << "OnlineLoopCloser: skip verify dump " << query_id << "-"
-                 << candidate_id << ", failed to load images";
-    return;
-  }
-
-  const Image& current = reconstruction.Image(query_id);
-  const Image& candidate = reconstruction.Image(candidate_id);
-
-  const auto SavePairs =
-      [&](const std::string& suffix,
-          const std::vector<std::pair<Eigen::Vector2d, Eigen::Vector2d>>&
-              pairs,
-          const BitmapColor<uint8_t>& color) {
-        if (pairs.empty()) {
-          return;
-        }
-        Bitmap canvas =
-            MakeSideBySideMatchImage(bmp_query, bmp_cand, pairs, color);
-        std::ostringstream name;
-        name << "q" << query_id << "_c" << candidate_id << "_" << suffix
-             << "_n" << pairs.size() << ".png";
-        const std::filesystem::path out_path = query_dir / name.str();
-        if (!canvas.Write(out_path)) {
-          LOG(WARNING) << "OnlineLoopCloser: failed to write "
-                       << out_path.string();
-        }
-      };
-
-  // Matches from ReadMatches(candidate, query): idx1=candidate, idx2=query.
-  {
-    std::vector<std::pair<Eigen::Vector2d, Eigen::Vector2d>> pairs;
-    pairs.reserve(matches.size());
-    for (const FeatureMatch& m : matches) {
-      if (m.point2D_idx2 >= current.NumPoints2D() ||
-          m.point2D_idx1 >= candidate.NumPoints2D()) {
-        continue;
-      }
-      pairs.emplace_back(current.Point2D(m.point2D_idx2).xy,
-                         candidate.Point2D(m.point2D_idx1).xy);
-    }
-    SavePairs("01_matches", pairs, BitmapColor<uint8_t>(0, 255, 0));
-  }
-
-  const auto CorrPairs = [&](const bool inliers_only) {
-    std::vector<std::pair<Eigen::Vector2d, Eigen::Vector2d>> pairs;
-    if (!candidate.HasPose() || !candidate.HasCameraPtr()) {
-      return pairs;
-    }
-    pairs.reserve(corrs.size());
-    for (size_t i = 0; i < corrs.size(); ++i) {
-      if (inliers_only && (i >= pnp_inliers.size() || !pnp_inliers[i])) {
-        continue;
-      }
-      if (!reconstruction.ExistsPoint3D(corrs[i].point3D_id)) {
-        continue;
-      }
-      const auto proj = ProjectCam(
-          *candidate.CameraPtr(),
-          candidate.CamFromWorld() *
-              reconstruction.Point3D(corrs[i].point3D_id).xyz);
-      if (proj && InsideImage(*candidate.CameraPtr(), *proj)) {
-        pairs.emplace_back(corrs[i].xy_current, *proj);
-      }
-    }
-    return pairs;
-  };
-  SavePairs("02_n3d", CorrPairs(false), BitmapColor<uint8_t>(0, 200, 255));
-  SavePairs(
-      "03_pnp_inliers", CorrPairs(true), BitmapColor<uint8_t>(255, 64, 64));
-}
-
 bool SetImagePose(Image& image, const Rigid3d& cam_from_world) {
   if (!image.HasFramePtr()) {
     return false;
@@ -619,10 +318,6 @@ OnlineLoopCloser::OnlineLoopCloser(std::string database_path,
     LOG(INFO) << "OnlineLoopCloser: disabled by options";
     return;
   }
-  mixvpr_topk_dir_ =
-      TimingStats::FileBesideDatabase(database_path_, "mixvpr_topk");
-  loop_verify_dir_ =
-      TimingStats::FileBesideDatabase(database_path_, "loop_verify");
   timing_ = std::make_unique<TimingStats>(
       TimingStats::FileBesideDatabase(database_path_, "loop_pairs.txt"),
       "loop",
@@ -651,25 +346,6 @@ OnlineLoopCloser::OnlineLoopCloser(std::string database_path,
                    std::to_string(options_.min_num_matches));
   timing_->AddMeta("min_num_verified_matches",
                    std::to_string(options_.min_num_verified_matches));
-
-  std::error_code ec;
-  std::filesystem::create_directories(mixvpr_topk_dir_, ec);
-  if (ec) {
-    LOG(WARNING) << "OnlineLoopCloser: failed to create MixVPR image dump dir "
-                 << mixvpr_topk_dir_ << " : " << ec.message();
-  } else {
-    LOG(INFO) << "OnlineLoopCloser: writing MixVPR top-k images to "
-              << mixvpr_topk_dir_;
-  }
-  ec.clear();
-  std::filesystem::create_directories(loop_verify_dir_, ec);
-  if (ec) {
-    LOG(WARNING) << "OnlineLoopCloser: failed to create loop verify dump dir "
-                 << loop_verify_dir_ << " : " << ec.message();
-  } else {
-    LOG(INFO) << "OnlineLoopCloser: writing loop verify images to "
-              << loop_verify_dir_;
-  }
 }
 
 OnlineLoopCloser::~OnlineLoopCloser() = default;
@@ -731,7 +407,6 @@ bool OnlineLoopCloser::Process(const image_t image_id,
 
   LOG(INFO) << "OnlineLoopCloser: image " << image_id << " has "
             << candidates.size() << " loop candidate(s)";
-  DumpMixVprTopkImages(image_id, image_abs_path, cache, candidates);
 
   const auto RecordPair = [&](const OnlineLoopPair& pair, const char* status) {
     timing_->Record(
@@ -767,15 +442,45 @@ bool OnlineLoopCloser::Process(const image_t image_id,
   OnlineLoopPair confirmed_pair;
   OnlineLoopPair best_attempt;
   bool has_attempt = false;
+  std::vector<image_t> candidate_ids;
+  candidate_ids.reserve(candidates.size());
+  for (const auto& [candidate_id, score] : candidates) {
+    candidate_ids.push_back(candidate_id);
+  }
+  // Drop weak stored pairs so the batch rematch uses the loop match threshold,
+  // which is stricter than the matcher's own inlier gate.
+  try {
+    DatabaseSession session(database_path_);
+    for (const image_t candidate_id : candidate_ids) {
+      if (!session->ExistsTwoViewGeometry(candidate_id, image_id)) {
+        continue;
+      }
+      const TwoViewGeometry existing =
+          session->ReadTwoViewGeometry(candidate_id, image_id);
+      if (GeometryUsable(existing, options_.min_num_matches)) {
+        continue;
+      }
+      if (session->ExistsMatches(candidate_id, image_id)) {
+        session->DeleteMatches(candidate_id, image_id);
+      }
+      session->DeleteTwoViewGeometry(candidate_id, image_id);
+    }
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "OnlineLoopCloser: failed to clear weak pairs for image "
+                 << image_id << ": " << e.what();
+  }
+  if (matcher == nullptr ||
+      !matcher->MatchSpecificPairs(image_id, candidate_ids, cache)) {
+    LOG(WARNING) << "OnlineLoopCloser: batch matching image " << image_id
+                 << " against " << candidate_ids.size() << " candidate(s) failed";
+    return false;
+  }
   for (const auto& [candidate_id, score] : candidates) {
     OnlineLoopPair loop_pair;
     const bool ok = VerifyCandidate(image_id,
                                     candidate_id,
                                     score,
-                                    image_abs_path,
-                                    cache,
                                     reconstruction,
-                                    matcher,
                                     &loop_pair);
     if (loop_pair.image_id2 != kInvalidImageId) {
       if (!has_attempt || BetterAttempt(loop_pair, best_attempt)) {
@@ -1051,12 +756,9 @@ std::vector<std::pair<image_t, float>> OnlineLoopCloser::DetectLoop(
 bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
                                        const image_t candidate_id,
                                        const float retrieval_score,
-                                       const std::string& query_abs_path,
-                                       const DatabaseCache& cache,
                                        const Reconstruction& reconstruction,
-                                       OnlineFeatureMatcher* matcher,
                                        OnlineLoopPair* loop_pair) {
-  if (matcher == nullptr || loop_pair == nullptr) {
+  if (loop_pair == nullptr) {
     return false;
   }
 
@@ -1064,29 +766,6 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
   loop_pair->image_id2 = candidate_id;
   loop_pair->retrieval_score = retrieval_score;
   loop_pair->has_loop_pose = false;
-
-  try {
-    DatabaseSession session(database_path_);
-    if (session->ExistsTwoViewGeometry(candidate_id, image_id)) {
-      const TwoViewGeometry existing =
-          session->ReadTwoViewGeometry(candidate_id, image_id);
-      if (!GeometryUsable(existing, options_.min_num_matches)) {
-        if (session->ExistsMatches(candidate_id, image_id)) {
-          session->DeleteMatches(candidate_id, image_id);
-        }
-        session->DeleteTwoViewGeometry(candidate_id, image_id);
-      }
-    }
-  } catch (const std::exception& e) {
-    LOG(WARNING) << "OnlineLoopCloser: failed to inspect existing pair "
-                 << candidate_id << "-" << image_id << ": " << e.what();
-  }
-
-  if (!matcher->MatchSpecificPairs(image_id, {candidate_id}, cache)) {
-    LOG(WARNING) << "OnlineLoopCloser: matching " << candidate_id << "-"
-                 << image_id << " failed";
-    return false;
-  }
 
   FeatureMatches matches;
   TwoViewGeometry geometry;
@@ -1097,8 +776,21 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
     if (session->ExistsMatches(candidate_id, image_id)) {
       matches = session->ReadMatches(candidate_id, image_id);
     }
+    loop_pair->num_matches = matches.size();
+    if (matches.size() < static_cast<size_t>(options_.min_num_matches)) {
+      LOG(INFO) << "OnlineLoopCloser: reject " << image_id << "-"
+                << candidate_id << ", matches=" << matches.size();
+      return false;
+    }
     if (session->ExistsTwoViewGeometry(candidate_id, image_id)) {
       geometry = session->ReadTwoViewGeometry(candidate_id, image_id);
+    }
+    loop_pair->num_inliers = geometry.inlier_matches.size();
+    if (!GeometryUsable(geometry, options_.min_num_matches)) {
+      LOG(INFO) << "OnlineLoopCloser: reject " << image_id << "-"
+                << candidate_id
+                << ", essential inliers=" << geometry.inlier_matches.size();
+      return false;
     }
     if (session->ExistsDescriptors(image_id)) {
       desc_current = session->ReadDescriptors(image_id);
@@ -1109,20 +801,6 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
   } catch (const std::exception& e) {
     LOG(WARNING) << "OnlineLoopCloser: failed to read pair " << candidate_id
                  << "-" << image_id << ": " << e.what();
-    return false;
-  }
-
-  loop_pair->num_matches = matches.size();
-  loop_pair->num_inliers = geometry.inlier_matches.size();
-
-  if (matches.size() < static_cast<size_t>(options_.min_num_matches)) {
-    LOG(INFO) << "OnlineLoopCloser: reject " << image_id << "-" << candidate_id
-              << ", matches=" << matches.size();
-    return false;
-  }
-  if (!GeometryUsable(geometry, options_.min_num_matches)) {
-    LOG(INFO) << "OnlineLoopCloser: reject " << image_id << "-" << candidate_id
-              << ", essential inliers=" << geometry.inlier_matches.size();
     return false;
   }
 
@@ -1149,16 +827,6 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
   loop_pair->num_3d_correspondences = corrs.size();
   if (corrs.size() <
       static_cast<size_t>(options_.min_num_3d_correspondences)) {
-    DumpLoopVerifyVisuals(loop_verify_dir_,
-                          database_path_,
-                          image_id,
-                          candidate_id,
-                          query_abs_path,
-                          cache,
-                          reconstruction,
-                          verify_matches,
-                          corrs,
-                          /*pnp_inliers=*/{});
     LOG(INFO) << "OnlineLoopCloser: reject " << image_id << "-" << candidate_id
               << ", 2D-3D=" << corrs.size()
               << " inliers=" << geometry.inlier_matches.size();
@@ -1201,16 +869,6 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
   loop_pair->num_3d_inliers = pnp_ok ? num_ransac_inliers : 0;
   if (!pnp_ok || num_ransac_inliers <
                      static_cast<size_t>(options_.min_num_3d_inliers)) {
-    DumpLoopVerifyVisuals(loop_verify_dir_,
-                          database_path_,
-                          image_id,
-                          candidate_id,
-                          query_abs_path,
-                          cache,
-                          reconstruction,
-                          verify_matches,
-                          corrs,
-                          inliers);
     LOG(INFO) << "OnlineLoopCloser: reject " << image_id << "-" << candidate_id
               << ", pnp ransac failed 2D-3D=" << corrs.size()
               << " inliers=" << loop_pair->num_3d_inliers;
@@ -1264,16 +922,6 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
         corrs, reconstruction, cam_from_world, camera, options_.pnp_max_error);
   }
   const size_t num_pnp_inliers = CountInliers(inliers);
-  DumpLoopVerifyVisuals(loop_verify_dir_,
-                        database_path_,
-                        image_id,
-                        candidate_id,
-                        query_abs_path,
-                        cache,
-                        reconstruction,
-                        verify_matches,
-                        corrs,
-                        inliers);
 
   const Rigid3d& pose_before = current.CamFromWorld();
   loop_pair->correction_m =
@@ -1971,61 +1619,6 @@ std::vector<image_t> OnlineLoopCloser::RankedCovisible(
     ids.push_back(item.second);
   }
   return ids;
-}
-
-void OnlineLoopCloser::DumpMixVprTopkImages(
-    const image_t query_id,
-    const std::string& query_abs_path,
-    const DatabaseCache& cache,
-    const std::vector<std::pair<image_t, float>>& ranked) const {
-  if (mixvpr_topk_dir_.empty() || ranked.empty()) {
-    return;
-  }
-
-  std::ostringstream folder;
-  folder << "query_" << std::setfill('0') << std::setw(6) << query_id;
-  const std::filesystem::path query_dir =
-      std::filesystem::path(mixvpr_topk_dir_) / folder.str();
-  std::error_code ec;
-  std::filesystem::create_directories(query_dir, ec);
-  if (ec) {
-    LOG(WARNING) << "OnlineLoopCloser: failed to create " << query_dir.string()
-                 << " : " << ec.message();
-    return;
-  }
-
-  const auto query_src = KeyframeImagePath(
-      query_id, query_abs_path, query_id, cache, database_path_);
-  std::string query_ext = query_src.extension().string();
-  if (query_ext.empty()) {
-    query_ext = ".png";
-  }
-  const std::filesystem::path query_dst =
-      query_dir / ("id" + std::to_string(query_id) + "_query" +
-                   std::to_string(query_id) + "_cand-_score-" + query_ext);
-  if (!CopyKeyframeImage(query_src, query_dst)) {
-    LOG(WARNING) << "OnlineLoopCloser: failed to save query image " << query_id
-                 << " from " << query_src.string();
-  }
-
-  for (size_t i = 0; i < ranked.size(); ++i) {
-    const image_t cand_id = ranked[i].first;
-    const auto cand_src = KeyframeImagePath(
-        cand_id, query_abs_path, query_id, cache, database_path_);
-    std::string ext = cand_src.extension().string();
-    if (ext.empty()) {
-      ext = query_ext;
-    }
-    std::ostringstream name;
-    name << "id" << cand_id << "_query" << query_id << "_cand" << cand_id
-         << "_score" << ScoreForFilename(ranked[i].second) << ext;
-    const std::filesystem::path cand_dst = query_dir / name.str();
-    if (!CopyKeyframeImage(cand_src, cand_dst)) {
-      LOG(WARNING) << "OnlineLoopCloser: failed to save MixVPR candidate "
-                   << query_id << "-" << cand_id << " from "
-                   << cand_src.string();
-    }
-  }
 }
 
 }  // namespace colmap
