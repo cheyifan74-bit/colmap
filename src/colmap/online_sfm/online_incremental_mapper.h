@@ -84,6 +84,7 @@ class OnlineIncrementalMapper {
     return last_cam_from_world_prior_;
   }
   const std::vector<OnlineLoopPair>& ConfirmedLoops() const;
+  const Reconstruction& GetReconstruction() const;
 
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 

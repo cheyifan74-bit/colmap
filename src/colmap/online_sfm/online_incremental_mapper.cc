@@ -68,6 +68,10 @@ OnlineIncrementalMapper::OnlineIncrementalMapper(
 
 OnlineIncrementalMapper::~OnlineIncrementalMapper() = default;
 
+const Reconstruction& OnlineIncrementalMapper::GetReconstruction() const {
+  return mapper_->GetReconstruction();
+}
+
 const std::vector<OnlineLoopPair>& OnlineIncrementalMapper::ConfirmedLoops()
     const {
   static const std::vector<OnlineLoopPair> kEmpty;
