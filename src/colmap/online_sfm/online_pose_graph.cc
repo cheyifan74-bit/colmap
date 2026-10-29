@@ -92,11 +92,15 @@ PoseGraphSummary OptimizeSE3PoseGraph(
     AddNode(edge.image_id_j);
     Rigid3d& pi = cam_from_world->at(edge.image_id_i);
     Rigid3d& pj = cam_from_world->at(edge.image_id_j);
+    ceres::LossFunction* loss = nullptr;
+    if (edge.robust_loss_scale > 0.0) {
+      loss = new ceres::HuberLoss(edge.robust_loss_scale);
+    }
     problem.AddResidualBlock(
         RelativePoseCost::Create(edge.j_from_i,
                                  edge.weight * options.rotation_weight,
                                  edge.weight * options.translation_weight),
-        nullptr,
+        loss,
         pi.params.data(),
         pi.params.data() + 4,
         pj.params.data(),

@@ -31,6 +31,7 @@
 
 #include "colmap/geometry/rigid3.h"
 #include "colmap/online_sfm/online_feature_matcher.h"
+#include "colmap/online_sfm/online_pose_graph.h"
 #include "colmap/scene/database_cache.h"
 #include "colmap/scene/reconstruction.h"
 #include "colmap/sensor/bitmap.h"
@@ -186,6 +187,36 @@ class OnlineLoopCloser {
   std::vector<image_t> RankedCovisible(
       image_t image_id, const Reconstruction& reconstruction) const;
 
+  // Frozen PnP measurement. `query_from_map` is cam_query_from_cam_map at the
+  // moment the loop was accepted, and is never recomputed from later poses.
+  struct LoopConstraint {
+    image_t map_id = kInvalidImageId;
+    image_t query_id = kInvalidImageId;
+    Rigid3d query_from_map;
+    size_t num_inliers = 0;
+  };
+
+  double LoopConstraintWeight(size_t num_inliers, size_t ref_inliers) const;
+  // Queries within the cooldown and map frames in one covisibility group are
+  // the same place. The pose graph keeps a single edge per cluster.
+  bool SameLoopCluster(image_t query_a,
+                       image_t map_a,
+                       image_t query_b,
+                       image_t map_b,
+                       const Reconstruction& reconstruction) const;
+  bool HistoricalResidualPlausible(const Rigid3d& measured,
+                                   const Rigid3d& current_rel) const;
+  // Adds `current` plus historical constraints whose query frame is still in
+  // `variable_set`. Returns how many historical edges were added.
+  size_t AppendLoopEdges(const Reconstruction& reconstruction,
+                         const std::unordered_set<image_t>& variable_set,
+                         const LoopConstraint& current,
+                         const PoseGraphOptions& graph_options,
+                         std::unordered_map<image_t, Rigid3d>* poses_old,
+                         std::unordered_set<image_t>* fixed_ids,
+                         std::vector<PoseGraphEdge>* edges);
+  void RememberLoopConstraint(const LoopConstraint& constraint);
+
   std::string database_path_;
   OnlineLoopCloserOptions options_;
   bool disabled_ = false;
@@ -193,6 +224,8 @@ class OnlineLoopCloser {
   std::unique_ptr<MixVprEncoder> mixvpr_;
   std::unique_ptr<TimingStats> timing_;
   std::vector<OnlineLoopPair> confirmed_loops_;
+  // Successful loop corrections only. Not written to the database.
+  std::vector<LoopConstraint> loop_constraints_;
   OnlineLoopCorrection last_correction_;
   image_t last_loop_image_id_ = kInvalidImageId;
 };

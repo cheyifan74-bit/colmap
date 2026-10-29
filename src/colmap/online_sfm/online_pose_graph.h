@@ -16,6 +16,10 @@ struct PoseGraphEdge {
   image_t image_id_j = kInvalidImageId;
   Rigid3d j_from_i;
   double weight = 1.0;
+  // Huber knee on the residual L2 norm. <=0 keeps a squared residual.
+  // Loop edges set this in weighted-residual units so a bad historical
+  // measurement cannot dominate the odometry chain.
+  double robust_loss_scale = 0.0;
 };
 
 struct PoseGraphOptions {
