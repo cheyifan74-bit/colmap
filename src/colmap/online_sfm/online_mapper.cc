@@ -196,7 +196,11 @@ void OnlineMapper::NotifyNewImagePair(const image_t image_id1,
   if (!obs_manager_) {
     return;
   }
-  obs_manager_->AddImagePair(image_id1, image_id2);
+  // seed_point3D_counts: the pair was just added to the correspondence graph
+  // while mapping may already be running, so any already-triangulated partner
+  // point needs its per-point3D visibility counted for the new correspondences.
+  obs_manager_->AddImagePair(image_id1, image_id2,
+                             /*seed_point3D_counts=*/true);
 }
 
 void OnlineMapper::CacheDescriptors(
@@ -205,6 +209,10 @@ void OnlineMapper::CacheDescriptors(
   if (descriptors) {
     descriptors_[image_id] = std::move(descriptors);
   }
+}
+
+size_t OnlineMapper::LocalMapWindowSize() const {
+  return static_cast<size_t>(std::max(options_.local_map_num_images, 0));
 }
 
 std::vector<OnlineMapper::ProjectionMatch>
@@ -686,7 +694,120 @@ image_t OnlineMapper::FindInitPartner(const image_t image_id) const {
   return best_id;
 }
 
+bool OnlineMapper::LoadSparseMap(
+    std::vector<std::string>* registered_image_names) {
+  if (registered_image_names == nullptr) {
+    return false;
+  }
+  registered_image_names->clear();
+  if (sparse_path_.empty()) {
+    LOG(ERROR) << "OnlineMapper: empty sparse path, cannot resume";
+    return false;
+  }
+  try {
+    reconstruction_->Read(sparse_path_);
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "OnlineMapper: failed to read sparse map at " << sparse_path_
+               << ": " << e.what();
+    return false;
+  }
+  for (const image_t image_id : reconstruction_->RegImageIds()) {
+    registered_image_names->push_back(reconstruction_->Image(image_id).Name());
+  }
+  LOG(INFO) << "OnlineMapper: loaded sparse map "
+            << sparse_path_ << " frames=" << reconstruction_->NumRegImages()
+            << " points=" << reconstruction_->NumPoints3D();
+  return !registered_image_names->empty();
+}
+
+bool OnlineMapper::RebuildAfterRestore() {
+  if (!database_cache_ || database_cache_->NumImages() == 0) {
+    LOG(ERROR) << "OnlineMapper: cannot restore, database cache has no images";
+    return false;
+  }
+  const size_t num_reg_before = reconstruction_->NumRegImages();
+  try {
+    // Only adds metadata for cache images; restored poses and points stay.
+    reconstruction_->Load(*database_cache_);
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "OnlineMapper: existing map does not match the current "
+                  "feature configuration: "
+               << e.what();
+    return false;
+  }
+  if (reconstruction_->NumRegImages() != num_reg_before) {
+    LOG(WARNING) << "OnlineMapper: restore changed registered frames from "
+                 << num_reg_before << " to " << reconstruction_->NumRegImages();
+  }
+  obs_manager_ = std::make_shared<ObservationManager>(
+      *reconstruction_, database_cache_->CorrespondenceGraph());
+  triangulator_ = std::make_shared<IncrementalTriangulator>(
+      database_cache_->CorrespondenceGraph(), *reconstruction_, obs_manager_);
+  initialized_ = reconstruction_->NumRegImages() > 0;
+  LOG(INFO) << "OnlineMapper: resumed map frames="
+            << reconstruction_->NumRegImages()
+            << " points=" << reconstruction_->NumPoints3D()
+            << " cache_images=" << database_cache_->NumImages()
+            << " initialized=" << initialized_;
+  return initialized_;
+}
+
+bool OnlineMapper::RegisterRelocalizedFrame(
+    const image_t image_id,
+    const Rigid3d& cam_from_world,
+    const Rigid3d& vio_cam_from_world,
+    const std::vector<std::pair<point2D_t, point3D_t>>& loop_observations) {
+  if (!reconstruction_->ExistsImage(image_id)) {
+    LOG(ERROR) << "OnlineMapper: relocalized image " << image_id
+               << " missing from reconstruction";
+    return false;
+  }
+  if (!RegisterImageWithKnownPose(image_id, cam_from_world)) {
+    return false;
+  }
+  // VIO-frame prior only. Using the map pose here would poison the chain that
+  // MapFrameCamFromWorld() uses for every following frame.
+  pose_priors_[image_id] = vio_cam_from_world;
+  initialized_ = true;
+
+  Image& image = reconstruction_->Image(image_id);
+  size_t num_attached = 0;
+  for (const auto& [point2D_idx, point3D_id] : loop_observations) {
+    if (point2D_idx >= image.NumPoints2D() ||
+        image.Point2D(point2D_idx).HasPoint3D() ||
+        !reconstruction_->ExistsPoint3D(point3D_id)) {
+      continue;
+    }
+    try {
+      obs_manager_->AddObservation(point3D_id,
+                                   TrackElement(image_id, point2D_idx));
+      ++num_attached;
+    } catch (const std::exception& e) {
+      LOG(WARNING) << "OnlineMapper: attach relocalization point " << point3D_id
+                   << " to image " << image_id << " failed: " << e.what();
+    }
+  }
+
+  ExtendTracksByProjection(image_id, "reloc");
+  TriangulateImage(image_id);
+  MergeAndFilterPoints(image_id);
+  AdjustLocalBundle(image_id);
+  LOG(INFO) << "OnlineMapper: relocalized image " << image_id
+            << " attached_map_points=" << num_attached
+            << " center=" << cam_from_world.TgtOriginInSrc().transpose();
+  return true;
+}
+
 bool OnlineMapper::TryInitialize(const image_t image_id) {
+  // A resumed map already has registered frames. Starting a second, disjoint
+  // component inside the same reconstruction would corrupt the sparse model.
+  if (reconstruction_->NumRegFrames() > 0) {
+    initialized_ = true;
+    LOG(WARNING) << "OnlineMapper: skip init for image " << image_id
+                 << ", map already has " << reconstruction_->NumRegFrames()
+                 << " registered frame(s)";
+    return true;
+  }
   const auto current_prior = pose_priors_.find(image_id);
   if (current_prior == pose_priors_.end()) {
     LOG(INFO) << "OnlineMapper: init wait, image " << image_id

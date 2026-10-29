@@ -34,6 +34,7 @@
 #include "colmap/math/math.h"
 #include "colmap/scene/camera.h"
 #include "colmap/scene/projection.h"
+#include "colmap/scene/two_view_geometry.h"
 #include "colmap/util/hash_containers.h"
 #include "colmap/util/logging.h"
 
@@ -166,7 +167,8 @@ ObservationManager::ImageStat ObservationManager::InitImageStat(
 }
 
 void ObservationManager::AddImagePair(const image_t image_id1,
-                                      const image_t image_id2) {
+                                      const image_t image_id2,
+                                      const bool seed_point3D_counts) {
   if (correspondence_graph_ == nullptr || image_id1 == image_id2) {
     return;
   }
@@ -197,6 +199,34 @@ void ObservationManager::AddImagePair(const image_t image_id1,
       correspondence_graph_->NumObservationsForImage(image_id2);
   stats2.num_correspondences =
       correspondence_graph_->NumCorrespondencesForImage(image_id2);
+
+  if (!seed_point3D_counts) {
+    return;
+  }
+
+  // Seed the per-point "correspondence has point3D" counters for the matches
+  // that were just added. Without this, a triangulated point in one of the two
+  // images that gets deleted/merged later would decrement the counter of its
+  // new correspondence (ResetTriObservations) even though the matching
+  // increment never happened: the point was triangulated before this pair
+  // existed.
+  FeatureMatches matches;
+  correspondence_graph_->ExtractMatchesBetweenImages(
+      image_id1, image_id2, matches);
+  const Image& image1 = reconstruction_.Image(image_id1);
+  const Image& image2 = reconstruction_.Image(image_id2);
+  for (const FeatureMatch& match : matches) {
+    if (match.point2D_idx1 >= image1.NumPoints2D() ||
+        match.point2D_idx2 >= image2.NumPoints2D()) {
+      continue;
+    }
+    if (image2.Point2D(match.point2D_idx2).HasPoint3D()) {
+      IncrementCorrespondenceHasPoint3D(image_id1, match.point2D_idx1);
+    }
+    if (image1.Point2D(match.point2D_idx1).HasPoint3D()) {
+      IncrementCorrespondenceHasPoint3D(image_id2, match.point2D_idx2);
+    }
+  }
 }
 
 void ObservationManager::IncrementCorrespondenceHasPoint3D(

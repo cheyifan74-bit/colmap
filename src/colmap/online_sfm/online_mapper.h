@@ -44,6 +44,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <ceres/loss_function.h>
@@ -107,10 +108,31 @@ class OnlineMapper {
   // Descriptors in keypoint order, used by local-map projection matching.
   void CacheDescriptors(image_t image_id,
                         std::shared_ptr<const FeatureDescriptors> descriptors);
+  // How many recent registered frames the local-map projection matching uses.
+  // Callers resuming a map preload this window's descriptors.
+  size_t LocalMapWindowSize() const;
 
 
   bool MappingCurrentImage(image_t image_id,
                            const std::optional<Rigid3d>& vio_prior);
+
+  // Load `sparse_path_` from disk and rebuild the runtime state (observation
+  // manager / triangulator) so mapping continues on the existing map.
+  // `registered_image_names` receives the names of the loaded registered
+  // images; the caller uses them to build the filtered database cache.
+  bool LoadSparseMap(std::vector<std::string>* registered_image_names);
+  // Second half of the restore, after the database cache holds those images.
+  bool RebuildAfterRestore();
+  // Register a relocalized frame: `cam_from_world` is the map pose from PnP,
+  // `vio_cam_from_world` the VIO-frame pose. Only the VIO pose goes into the
+  // prior chain, so later frames inherit the map pose and not the VIO one.
+  bool RegisterRelocalizedFrame(
+      image_t image_id,
+      const Rigid3d& cam_from_world,
+      const Rigid3d& vio_cam_from_world,
+      const std::vector<std::pair<point2D_t, point3D_t>>& loop_observations);
+  bool HasMappedFrames() const { return initialized_; }
+  void MarkInitialized() { initialized_ = true; }
 
   bool Initialized() const { return initialized_; }
   const Reconstruction& GetReconstruction() const { return *reconstruction_; }

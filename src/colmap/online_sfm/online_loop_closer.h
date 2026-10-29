@@ -94,6 +94,16 @@ struct OnlineLoopCloserOptions {
   // Projection fusion after correction.
   double fuse_radius_px = 6.0;
   double fuse_max_point_distance = 0.2;
+
+  // Relocalization against a map resumed from disk. The current frame has no
+  // pose yet, so retrieval runs over the whole stored map and the thresholds
+  // are stricter than loop closure: a wrong fix biases every following frame.
+  int reloc_topk = 5;
+  double reloc_min_mixvpr_score = 0.5;
+  int reloc_min_num_matches = 30;
+  int reloc_min_num_3d_correspondences = 40;
+  int reloc_min_inliers = 80;
+  double reloc_max_rot_vs_essential_deg = 3.0;
 };
 
 struct OnlineLoopPair {
@@ -154,6 +164,19 @@ class OnlineLoopCloser {
     return last_correction_;
   }
 
+  // Global relocalization for a resumed map: MixVPR retrieval over every stored
+  // descriptor, then PnP of `image_id` against the retrieved map frames. The
+  // current frame must exist in `reconstruction` with keypoints but no pose.
+  // On success `loop_pair` holds the map pose (`loop_cam_from_world`) and the
+  // inlier 2D-3D correspondences.
+  bool Relocalize(image_t image_id,
+                  const DatabaseCache& cache,
+                  const Reconstruction& reconstruction,
+                  OnlineFeatureMatcher* matcher,
+                  const std::string& image_abs_path,
+                  const Bitmap* bitmap,
+                  OnlineLoopPair* loop_pair);
+
   // Project the loop-side map into the fusion window again, after loop BA has
   // moved poses and points, and merge pairs now within the fuse distance.
   void FuseAfterLoopBA(Reconstruction& reconstruction,
@@ -168,10 +191,28 @@ class OnlineLoopCloser {
       const Reconstruction& reconstruction);
   // Matches for every candidate are already written. Reads that pair and runs
   // PnP only when the match count is high enough.
+  // Acceptance thresholds differ between loop closure and relocalization.
+  struct CandidateGate {
+    size_t min_matches = 0;
+    size_t min_3d_corrs = 0;
+    size_t min_inliers = 0;
+    double max_rot_vs_essential_deg = -1.0;
+    // Relocalization runs before the frame has a pose.
+    bool require_current_pose = true;
+    // Loop closure rejects corrections larger than the configured gate.
+    bool check_correction = true;
+  };
+  CandidateGate LoopGate() const;
+  CandidateGate RelocGate() const;
+  bool EncodeQuery(image_t image_id,
+                   const std::string& image_abs_path,
+                   const Bitmap* bitmap,
+                   Eigen::VectorXf* query);
   bool VerifyCandidate(image_t image_id,
                        image_t candidate_id,
                        float retrieval_score,
                        const Reconstruction& reconstruction,
+                       const CandidateGate& gate,
                        OnlineLoopPair* loop_pair);
   bool CorrectLoop(Reconstruction& reconstruction,
                    ObservationManager* obs_manager,

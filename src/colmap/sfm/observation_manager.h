@@ -78,7 +78,19 @@ class ObservationManager {
   // Refresh pair / image correspondence counts after a late AddTwoViewGeometry
   // between two images that are already in this manager. No-op if either
   // image is missing or the graph has no matches for the pair.
-  void AddImagePair(image_t image_id1, image_t image_id2);
+  //
+  // If `seed_point3D_counts` is true, the per-image-point
+  // `num_correspondences_have_point3D` counters are incremented for every match
+  // of the pair as well. This is required whenever a two-view geometry is added
+  // *while* a session is already mapping: the partner images may already carry
+  // triangulated points, and deleting/merging one of those points later
+  // (ResetTriObservations) decrements this image's counter for the new
+  // correspondence, which would underflow if it was never counted.
+  // AddTwoViewGeometry() rejects pre-existing pairs, so all matches of the pair
+  // are new and must be counted exactly once here.
+  void AddImagePair(image_t image_id1,
+                    image_t image_id2,
+                    bool seed_point3D_counts = false);
 
   // Add new 3D object, and return its unique ID.
   point3D_t AddPoint3D(

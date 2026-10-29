@@ -359,9 +359,68 @@ OnlineLoopCloser::OnlineLoopCloser(std::string database_path,
                    std::to_string(options_.min_num_matches));
   timing_->AddMeta("min_num_verified_matches",
                    std::to_string(options_.min_num_verified_matches));
+  timing_->AddMeta("reloc_topk", std::to_string(options_.reloc_topk));
+  timing_->AddMeta("reloc_min_mixvpr_score",
+                   std::to_string(options_.reloc_min_mixvpr_score));
+  timing_->AddMeta("reloc_min_num_matches",
+                   std::to_string(options_.reloc_min_num_matches));
+  timing_->AddMeta("reloc_min_num_3d_correspondences",
+                   std::to_string(options_.reloc_min_num_3d_correspondences));
+  timing_->AddMeta("reloc_min_inliers",
+                   std::to_string(options_.reloc_min_inliers));
+  timing_->AddMeta("reloc_max_rot_vs_essential_deg",
+                   std::to_string(options_.reloc_max_rot_vs_essential_deg));
 }
 
 OnlineLoopCloser::~OnlineLoopCloser() = default;
+
+bool OnlineLoopCloser::EncodeQuery(const image_t image_id,
+                                   const std::string& image_abs_path,
+                                   const Bitmap* bitmap,
+                                   Eigen::VectorXf* query) {
+  if (query == nullptr) {
+    return false;
+  }
+  if (!InitMixVprModel()) {
+    return false;
+  }
+  const bool encoded = (bitmap != nullptr && !bitmap->IsEmpty())
+                           ? mixvpr_->Encode(*bitmap, query)
+                           : mixvpr_->Encode(image_abs_path, query);
+  if (!encoded || query->size() != kMixVprDescDim) {
+    LOG(WARNING) << "OnlineLoopCloser: MixVPR encode failed for image "
+                 << image_id << " path=" << image_abs_path
+                 << " desc_dim=" << query->size();
+    return false;
+  }
+  return true;
+}
+
+OnlineLoopCloser::CandidateGate OnlineLoopCloser::LoopGate() const {
+  CandidateGate gate;
+  gate.min_matches = static_cast<size_t>(std::max(options_.min_num_matches, 0));
+  gate.min_3d_corrs =
+      static_cast<size_t>(std::max(options_.min_num_3d_correspondences, 0));
+  gate.min_inliers =
+      static_cast<size_t>(std::max(options_.min_num_verified_matches, 0));
+  gate.max_rot_vs_essential_deg = options_.max_rot_vs_essential_deg;
+  gate.require_current_pose = true;
+  gate.check_correction = true;
+  return gate;
+}
+
+OnlineLoopCloser::CandidateGate OnlineLoopCloser::RelocGate() const {
+  CandidateGate gate;
+  gate.min_matches =
+      static_cast<size_t>(std::max(options_.reloc_min_num_matches, 0));
+  gate.min_3d_corrs =
+      static_cast<size_t>(std::max(options_.reloc_min_num_3d_correspondences, 0));
+  gate.min_inliers = static_cast<size_t>(std::max(options_.reloc_min_inliers, 0));
+  gate.max_rot_vs_essential_deg = options_.reloc_max_rot_vs_essential_deg;
+  gate.require_current_pose = false;
+  gate.check_correction = false;
+  return gate;
+}
 
 bool OnlineLoopCloser::Process(const image_t image_id,
                                const std::string& image_abs_path,
@@ -385,14 +444,7 @@ bool OnlineLoopCloser::Process(const image_t image_id,
   }
 
   Eigen::VectorXf query;
-  const bool encoded =
-      (bitmap != nullptr && !bitmap->IsEmpty())
-          ? mixvpr_->Encode(*bitmap, &query)
-          : mixvpr_->Encode(image_abs_path, &query);
-  if (!encoded || query.size() != kMixVprDescDim) {
-    LOG(WARNING) << "OnlineLoopCloser: MixVPR encode failed for image "
-                 << image_id << " path=" << image_abs_path
-                 << " desc_dim=" << query.size();
+  if (!EncodeQuery(image_id, image_abs_path, bitmap, &query)) {
     return false;
   }
 
@@ -494,6 +546,7 @@ bool OnlineLoopCloser::Process(const image_t image_id,
                                     candidate_id,
                                     score,
                                     reconstruction,
+                                    LoopGate(),
                                     &loop_pair);
     if (loop_pair.image_id2 != kInvalidImageId) {
       if (!has_attempt || BetterAttempt(loop_pair, best_attempt)) {
@@ -770,6 +823,7 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
                                        const image_t candidate_id,
                                        const float retrieval_score,
                                        const Reconstruction& reconstruction,
+                                       const CandidateGate& gate,
                                        OnlineLoopPair* loop_pair) {
   if (loop_pair == nullptr) {
     return false;
@@ -790,7 +844,7 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
       matches = session->ReadMatches(candidate_id, image_id);
     }
     loop_pair->num_matches = matches.size();
-    if (matches.size() < static_cast<size_t>(options_.min_num_matches)) {
+    if (matches.size() < gate.min_matches) {
       LOG(INFO) << "OnlineLoopCloser: reject " << image_id << "-"
                 << candidate_id << ", matches=" << matches.size();
       return false;
@@ -799,7 +853,7 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
       geometry = session->ReadTwoViewGeometry(candidate_id, image_id);
     }
     loop_pair->num_inliers = geometry.inlier_matches.size();
-    if (!GeometryUsable(geometry, options_.min_num_matches)) {
+    if (!GeometryUsable(geometry, static_cast<int>(gate.min_matches))) {
       LOG(INFO) << "OnlineLoopCloser: reject " << image_id << "-"
                 << candidate_id
                 << ", essential inliers=" << geometry.inlier_matches.size();
@@ -822,8 +876,9 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
                                              : geometry.inlier_matches;
   const Image& current = reconstruction.Image(image_id);
   const Image& candidate = reconstruction.Image(candidate_id);
-  if (!current.HasPose() || !candidate.HasPose() || !current.HasCameraPtr() ||
-      !candidate.HasCameraPtr()) {
+  if (!current.HasCameraPtr() || !candidate.HasCameraPtr() ||
+      !candidate.HasPose() ||
+      (gate.require_current_pose && !current.HasPose())) {
     return false;
   }
 
@@ -838,8 +893,7 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
                       &used_points,
                       &corrs);
   loop_pair->num_3d_correspondences = corrs.size();
-  if (corrs.size() <
-      static_cast<size_t>(options_.min_num_3d_correspondences)) {
+  if (corrs.size() < gate.min_3d_corrs) {
     LOG(INFO) << "OnlineLoopCloser: reject " << image_id << "-" << candidate_id
               << ", 2D-3D=" << corrs.size()
               << " inliers=" << geometry.inlier_matches.size();
@@ -936,11 +990,17 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
   }
   const size_t num_pnp_inliers = CountInliers(inliers);
 
-  const Rigid3d& pose_before = current.CamFromWorld();
-  loop_pair->correction_m =
-      (cam_from_world.TgtOriginInSrc() - pose_before.TgtOriginInSrc()).norm();
-  loop_pair->correction_deg =
-      RotationDiffDeg(cam_from_world.rotation(), pose_before.rotation());
+  const bool has_pose_before = current.HasPose();
+  if (has_pose_before) {
+    const Rigid3d& pose_before = current.CamFromWorld();
+    loop_pair->correction_m =
+        (cam_from_world.TgtOriginInSrc() - pose_before.TgtOriginInSrc()).norm();
+    loop_pair->correction_deg =
+        RotationDiffDeg(cam_from_world.rotation(), pose_before.rotation());
+  } else {
+    loop_pair->correction_m = 0.0;
+    loop_pair->correction_deg = 0.0;
+  }
   double tdir_vs_essential_deg = -1.0;
   loop_pair->rot_vs_essential_deg = RotationVsEssentialDeg(
       geometry, candidate, current, cam_from_world, &tdir_vs_essential_deg);
@@ -959,21 +1019,21 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
             << " rot_vs_E_deg=" << loop_pair->rot_vs_essential_deg
             << " tdir_vs_E_deg=" << tdir_vs_essential_deg;
 
-  if (num_pnp_inliers <
-      static_cast<size_t>(options_.min_num_verified_matches)) {
+  if (num_pnp_inliers < gate.min_inliers) {
     LOG(INFO) << "OnlineLoopCloser: reject " << image_id << "-" << candidate_id
               << ", pnp weak inliers=" << num_pnp_inliers;
     return false;
   }
-  if (options_.max_rot_vs_essential_deg > 0.0 &&
-      loop_pair->rot_vs_essential_deg > options_.max_rot_vs_essential_deg) {
+  if (gate.max_rot_vs_essential_deg > 0.0 &&
+      loop_pair->rot_vs_essential_deg > gate.max_rot_vs_essential_deg) {
     LOG(INFO) << "OnlineLoopCloser: reject " << image_id << "-" << candidate_id
               << ", pnp rotation disagrees with essential by "
               << loop_pair->rot_vs_essential_deg << " deg";
     return false;
   }
-  if (loop_pair->correction_m > options_.max_correction_m ||
-      loop_pair->correction_deg > options_.max_correction_deg) {
+  if (gate.check_correction &&
+      (loop_pair->correction_m > options_.max_correction_m ||
+       loop_pair->correction_deg > options_.max_correction_deg)) {
     LOG(INFO) << "OnlineLoopCloser: reject " << image_id << "-" << candidate_id
               << ", correction too large " << loop_pair->correction_m
               << " m / " << loop_pair->correction_deg << " deg";
@@ -994,6 +1054,135 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
             << " by pnp inliers=" << num_pnp_inliers
             << " correction_m=" << loop_pair->correction_m
             << " correction_deg=" << loop_pair->correction_deg;
+  return true;
+}
+
+bool OnlineLoopCloser::Relocalize(const image_t image_id,
+                                  const DatabaseCache& cache,
+                                  const Reconstruction& reconstruction,
+                                  OnlineFeatureMatcher* matcher,
+                                  const std::string& image_abs_path,
+                                  const Bitmap* bitmap,
+                                  OnlineLoopPair* loop_pair) {
+  if (loop_pair == nullptr || matcher == nullptr) {
+    return false;
+  }
+  if (!IsLoopClosureActive()) {
+    LOG(WARNING) << "OnlineLoopCloser: relocalization needs an active loop "
+                    "closer (MixVPR)";
+    return false;
+  }
+  if (!reconstruction.ExistsImage(image_id) ||
+      !reconstruction.Image(image_id).HasCameraPtr()) {
+    LOG(WARNING) << "OnlineLoopCloser: relocalize image " << image_id
+                 << " is not in the reconstruction";
+    return false;
+  }
+  if (reconstruction.Image(image_id).HasPose()) {
+    LOG(INFO) << "OnlineLoopCloser: image " << image_id
+              << " already has a pose, skip relocalization";
+    return false;
+  }
+
+  Eigen::VectorXf query;
+  if (!EncodeQuery(image_id, image_abs_path, bitmap, &query)) {
+    return false;
+  }
+  if (!StoreMixVprDescriptor(image_id, query)) {
+    return false;
+  }
+
+  std::vector<std::pair<image_t, Eigen::VectorXf>> entries;
+  try {
+    DatabaseSession session(database_path_);
+    entries = session->ReadAllMixVprDescriptors();
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "OnlineLoopCloser: relocalize failed to read MixVPR "
+                    "descriptors: "
+                 << e.what();
+    return false;
+  }
+  if (entries.empty()) {
+    LOG(INFO) << "OnlineLoopCloser: relocalize image " << image_id
+              << " has no stored map descriptors";
+    return false;
+  }
+
+  // No pose yet, so retrieval cannot be gated by distance / view angle. Only
+  // frames that carry a pose are valid PnP targets.
+  const auto usable = [&](const image_t id) {
+    return id != image_id && reconstruction.ExistsImage(id) &&
+           reconstruction.Image(id).HasPose();
+  };
+  std::vector<std::pair<image_t, float>> ranked =
+      RankMixVprMatches(query, entries, usable, options_.reloc_topk);
+  if (options_.reloc_min_mixvpr_score > 0.0) {
+    const float min_score =
+        static_cast<float>(options_.reloc_min_mixvpr_score);
+    ranked.erase(std::remove_if(ranked.begin(),
+                                ranked.end(),
+                                [min_score](const auto& item) {
+                                  return item.second < min_score;
+                                }),
+                 ranked.end());
+  }
+  if (ranked.empty()) {
+    LOG(INFO) << "OnlineLoopCloser: relocalize image " << image_id
+              << " descriptors=" << entries.size()
+              << " no candidate above score " << options_.reloc_min_mixvpr_score;
+    return false;
+  }
+
+  std::vector<image_t> candidate_ids;
+  candidate_ids.reserve(ranked.size());
+  for (const auto& [id, score] : ranked) {
+    candidate_ids.push_back(id);
+  }
+  if (!matcher->MatchSpecificPairs(image_id, candidate_ids, cache)) {
+    LOG(WARNING) << "OnlineLoopCloser: relocalize image " << image_id
+                 << " matching against " << candidate_ids.size()
+                 << " candidate(s) failed";
+    return false;
+  }
+
+  const CandidateGate gate = RelocGate();
+  OnlineLoopPair best;
+  bool has_best = false;
+  for (const auto& [candidate_id, score] : ranked) {
+    OnlineLoopPair attempt;
+    const bool ok = VerifyCandidate(
+        image_id, candidate_id, score, reconstruction, gate, &attempt);
+    LOG(INFO) << "OnlineLoopCloser: relocalize " << image_id << "-"
+              << candidate_id << " score=" << score
+              << " matches=" << attempt.num_matches
+              << " 2D-3D=" << attempt.num_3d_correspondences
+              << " inliers=" << attempt.num_3d_inliers
+              << " accepted=" << static_cast<int>(ok);
+    if (!ok) {
+      continue;
+    }
+    if (!has_best || attempt.num_3d_inliers > best.num_3d_inliers ||
+        (attempt.num_3d_inliers == best.num_3d_inliers &&
+         attempt.num_inliers > best.num_inliers)) {
+      best = attempt;
+      has_best = true;
+    }
+  }
+  if (!has_best) {
+    LOG(INFO) << "OnlineLoopCloser: relocalize image " << image_id
+              << " failed, candidates=" << candidate_ids.size();
+    return false;
+  }
+
+  *loop_pair = best;
+  // A successful relocalization is not a loop: keep it out of the loop list so
+  // the cooldown and the confirmed-loop log stay meaningful.
+  last_loop_image_id_ = image_id;
+  LOG(INFO) << "OnlineLoopCloser: RELOCALIZED " << image_id << "-"
+            << loop_pair->image_id2 << " inliers=" << loop_pair->num_3d_inliers
+            << " matches=" << loop_pair->num_matches
+            << " center="
+            << loop_pair->loop_cam_from_world.TgtOriginInSrc().transpose();
   return true;
 }
 

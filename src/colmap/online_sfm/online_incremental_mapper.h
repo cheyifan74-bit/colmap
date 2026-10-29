@@ -75,6 +75,19 @@ class OnlineIncrementalMapper {
                const std::optional<Rigid3d>& cam_from_world_prior =
                    std::nullopt);
 
+  // Load the map written by a previous session (sparse model + the matching
+  // part of the database) and switch to relocalization mode. Mapping resumes
+  // once a frame is relocalized against the loaded map.
+  bool ResumeFromDisk();
+
+  // True while waiting for the first successful relocalization.
+  bool WaitingForRelocalization() const {
+    return mode_ == SessionMode::kLocalizing;
+  }
+
+  // Flush the sparse model unconditionally (used on shutdown).
+  void FlushSparse();
+
   const std::shared_ptr<DatabaseCache>& GetDatabaseCache() const {
     return database_cache_;
   }
@@ -89,10 +102,24 @@ class OnlineIncrementalMapper {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
  private:
+  enum class SessionMode { kFresh, kLocalizing, kMapping };
+
   bool InitDatabaseCache();
   bool LoadCamerasFromDatabase();
   bool IngestImage(image_t image_id);
+  // Same, on an already open connection. Opening one DatabaseSession per image
+  // dominates the cost of restoring a large map (~0.8 ms each), so the resume
+  // path reuses a single session.
+  bool IngestImage(image_t image_id, Database* database);
+  // Ingest an already loaded image (skips the per-image ReadImage query).
+  bool IngestImage(class Image image, Database* database);
   bool IngestTwoViewGeometries(image_t image_id);
+  // One relocalization attempt in `kLocalizing`. Returns true when the frame
+  // was handled (registered or deliberately skipped).
+  bool LocalizeCurrent(image_t image_id,
+                       const std::string& image_abs_path,
+                       const std::optional<Rigid3d>& cam_from_world_prior,
+                       const Bitmap* bitmap);
 
   std::string database_path_;
   std::string sparse_path_;
@@ -106,6 +133,8 @@ class OnlineIncrementalMapper {
   image_t last_image_id_ = kInvalidImageId;
   std::string last_image_abs_path_;
   std::optional<Rigid3d> last_cam_from_world_prior_;
+  SessionMode mode_ = SessionMode::kFresh;
+  size_t reloc_attempts_ = 0;
 };
 
 }  // namespace colmap
