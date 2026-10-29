@@ -62,6 +62,11 @@ namespace {
 
 // Loop edge vs odometry edges in the pose graph (residual scale).
 constexpr double kLoopEdgeWeight = 10.0;
+// Inlier scale never drops the loop weight below this fraction.
+constexpr double kMinLoopEdgeWeightScale = 0.3;
+// Historical edges whose residual is farther than this multiple of the
+// correction gate are treated as broken measurements and left out.
+constexpr double kHistoricalResidualFactor = 2.0;
 // Candidate + covisibles used as the loop-side map for PnP and fusion.
 constexpr size_t kMaxLoopMapImages = 10;
 // A corrected frame joins the fusion / loop-BA window when at least this many
@@ -299,6 +304,14 @@ double RotationVsEssentialDeg(const TwoViewGeometry& geometry,
   }
   return RotationDiffDeg(pnp_cur_from_cand.rotation(),
                          e_cur_from_cand.rotation());
+}
+
+bool ImageIdsWithin(const image_t a, const image_t b, const int gap) {
+  if (gap < 0) {
+    return false;
+  }
+  const image_t delta = a > b ? a - b : b - a;
+  return delta <= static_cast<image_t>(gap);
 }
 
 bool SetImagePose(Image& image, const Rigid3d& cam_from_world) {
@@ -1251,7 +1264,7 @@ bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
     return false;
   }
 
-  // Stage A: SE3 pose graph (odometry + covisibility + loop edge).
+  // Stage A: SE3 pose graph (odometry + covisibility + loop edges).
   std::unordered_map<image_t, Rigid3d> poses_old;
   for (const image_t id : variable_ids) {
     poses_old[id] = reconstruction.Image(id).CamFromWorld();
@@ -1306,14 +1319,25 @@ bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
       ++num_old_covis_edges;
     }
   }
-  edges.push_back({loop_id,
-                   current_id,
-                   loop_pair.loop_cam_from_world * Inverse(poses_old[loop_id]),
-                   kLoopEdgeWeight});
+  // Freeze the PnP relative pose against the loop frame's pre-correction pose.
+  // Later graphs replay this measurement; they do not rebuild it from poses.
+  const LoopConstraint current_loop{
+      loop_id,
+      current_id,
+      loop_pair.loop_cam_from_world * Inverse(poses_old[loop_id]),
+      loop_pair.loop_observations.size()};
+  const PoseGraphOptions graph_options;
+  const size_t num_hist_loop_edges = AppendLoopEdges(reconstruction,
+                                                     variable_set,
+                                                     current_loop,
+                                                     graph_options,
+                                                     &poses_old,
+                                                     &fixed_ids,
+                                                     &edges);
 
   std::unordered_map<image_t, Rigid3d> poses = poses_old;
   const PoseGraphSummary pg =
-      OptimizeSE3PoseGraph(PoseGraphOptions(), edges, fixed_ids, &poses);
+      OptimizeSE3PoseGraph(graph_options, edges, fixed_ids, &poses);
   if (!pg.success) {
     LOG(WARNING) << "OnlineLoopCloser: CorrectLoop pose graph failed "
                  << current_id << "-" << loop_id << " nodes=" << pg.num_nodes
@@ -1473,6 +1497,7 @@ bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
             << " boundary=" << boundary_id << " anchor_max=" << anchor_max
             << " edges=" << pg.num_edges << " covis_edges=" << num_covis_edges
             << " old_covis_edges=" << num_old_covis_edges
+            << " hist_loop_edges=" << num_hist_loop_edges
             << " fixed_nodes=" << fixed_ids.size()
             << " cost=" << pg.initial_cost << "->" << pg.final_cost
             << " cur_vs_pnp_m=" << cur_vs_pnp_m
@@ -1489,7 +1514,11 @@ bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
             << " window=" << connected.size() << " ["
             << *std::min_element(connected.begin(), connected.end()) << ".."
             << *std::max_element(connected.begin(), connected.end()) << "]";
-  return num_poses_corrected > 0;
+  if (num_poses_corrected == 0) {
+    return false;
+  }
+  RememberLoopConstraint(current_loop);
+  return true;
 }
 
 void OnlineLoopCloser::FuseAfterLoopBA(Reconstruction& reconstruction,
@@ -1529,6 +1558,179 @@ void OnlineLoopCloser::FuseAfterLoopBA(Reconstruction& reconstruction,
             << " attach_proj=" << proj.num_attached
             << " fuse_rejected_dist=" << proj.num_rejected_dist
             << " fuse_rejected_desc=" << proj.num_rejected_desc;
+}
+
+double OnlineLoopCloser::LoopConstraintWeight(const size_t num_inliers,
+                                              const size_t ref_inliers) const {
+  // Provisional information ~ sqrt(inliers); the strongest edge of this graph
+  // gets the full loop weight and weaker ones a fraction of it.
+  if (num_inliers == 0 || ref_inliers == 0) {
+    return kLoopEdgeWeight * kMinLoopEdgeWeightScale;
+  }
+  const double ratio = static_cast<double>(num_inliers) /
+                       static_cast<double>(ref_inliers);
+  const double scale =
+      std::clamp(std::sqrt(ratio), kMinLoopEdgeWeightScale, 1.0);
+  return kLoopEdgeWeight * scale;
+}
+
+bool OnlineLoopCloser::SameLoopCluster(
+    const image_t query_a,
+    const image_t map_a,
+    const image_t query_b,
+    const image_t map_b,
+    const Reconstruction& reconstruction) const {
+  if (!ImageIdsWithin(query_a, query_b, options_.cooldown_num_images)) {
+    return false;
+  }
+  if (map_a == map_b) {
+    return true;
+  }
+  return CovisibilityGroup(map_a, reconstruction).count(map_b) > 0;
+}
+
+bool OnlineLoopCloser::HistoricalResidualPlausible(
+    const Rigid3d& measured, const Rigid3d& current_rel) const {
+  const Rigid3d error = Inverse(measured) * current_rel;
+  const double trans_m = error.translation().norm();
+  const double rot_deg =
+      RotationDiffDeg(measured.rotation(), current_rel.rotation());
+  if (options_.max_correction_m > 0.0 &&
+      trans_m > kHistoricalResidualFactor * options_.max_correction_m) {
+    return false;
+  }
+  if (options_.max_correction_deg > 0.0 &&
+      rot_deg > kHistoricalResidualFactor * options_.max_correction_deg) {
+    return false;
+  }
+  return true;
+}
+
+size_t OnlineLoopCloser::AppendLoopEdges(
+    const Reconstruction& reconstruction,
+    const std::unordered_set<image_t>& variable_set,
+    const LoopConstraint& current,
+    const PoseGraphOptions& graph_options,
+    std::unordered_map<image_t, Rigid3d>* poses_old,
+    std::unordered_set<image_t>* fixed_ids,
+    std::vector<PoseGraphEdge>* edges) {
+  std::vector<LoopConstraint> replay;
+  replay.reserve(loop_constraints_.size());
+  for (const LoopConstraint& stored : loop_constraints_) {
+    if (stored.map_id == current.map_id &&
+        stored.query_id == current.query_id) {
+      continue;
+    }
+    if (variable_set.count(stored.query_id) == 0 ||
+        stored.map_id == stored.query_id ||
+        poses_old->count(stored.query_id) == 0) {
+      continue;
+    }
+    if (!reconstruction.ExistsImage(stored.map_id) ||
+        !reconstruction.ExistsImage(stored.query_id) ||
+        !reconstruction.Image(stored.map_id).HasPose() ||
+        !reconstruction.Image(stored.query_id).HasPose()) {
+      continue;
+    }
+    if (poses_old->count(stored.map_id) == 0) {
+      (*poses_old)[stored.map_id] =
+          reconstruction.Image(stored.map_id).CamFromWorld();
+    }
+    const Rigid3d current_rel = poses_old->at(stored.query_id) *
+                                Inverse(poses_old->at(stored.map_id));
+    if (!HistoricalResidualPlausible(stored.query_from_map, current_rel)) {
+      LOG(INFO) << "OnlineLoopCloser: skip historical loop " << stored.query_id
+                << "-" << stored.map_id << ", residual exceeds "
+                << kHistoricalResidualFactor << "x correction gate";
+      continue;
+    }
+    replay.push_back(stored);
+  }
+  std::sort(replay.begin(),
+            replay.end(),
+            [](const LoopConstraint& a, const LoopConstraint& b) {
+              if (a.num_inliers != b.num_inliers) {
+                return a.num_inliers > b.num_inliers;
+              }
+              return a.query_id < b.query_id;
+            });
+
+  // Current edge is kept even when an older edge has more inliers, so this
+  // correction is not replaced by a previous measurement of the same place.
+  std::vector<LoopConstraint> selected;
+  selected.push_back(current);
+  size_t num_hist = 0;
+  for (const LoopConstraint& candidate : replay) {
+    bool clustered = false;
+    for (const LoopConstraint& kept : selected) {
+      if (!SameLoopCluster(candidate.query_id,
+                           candidate.map_id,
+                           kept.query_id,
+                           kept.map_id,
+                           reconstruction)) {
+        continue;
+      }
+      clustered = true;
+      LOG(INFO) << "OnlineLoopCloser: drop clustered loop "
+                << candidate.query_id << "-" << candidate.map_id
+                << " inliers=" << candidate.num_inliers << ", keep "
+                << kept.query_id << "-" << kept.map_id
+                << " inliers=" << kept.num_inliers;
+      break;
+    }
+    if (clustered) {
+      continue;
+    }
+    selected.push_back(candidate);
+    ++num_hist;
+  }
+
+  const double correction_m = std::max(options_.max_correction_m, 1.0);
+  size_t ref_inliers = 0;
+  for (const LoopConstraint& edge : selected) {
+    ref_inliers = std::max(ref_inliers, edge.num_inliers);
+  }
+  for (const LoopConstraint& edge : selected) {
+    if (poses_old->count(edge.map_id) == 0 &&
+        reconstruction.ExistsImage(edge.map_id) &&
+        reconstruction.Image(edge.map_id).HasPose()) {
+      (*poses_old)[edge.map_id] =
+          reconstruction.Image(edge.map_id).CamFromWorld();
+    }
+    if (poses_old->count(edge.map_id) == 0 ||
+        poses_old->count(edge.query_id) == 0) {
+      continue;
+    }
+    if (variable_set.count(edge.map_id) == 0) {
+      fixed_ids->insert(edge.map_id);
+    }
+    const bool is_current =
+        edge.map_id == current.map_id && edge.query_id == current.query_id;
+    // This correction keeps its full weight; historical edges are scaled
+    // against the strongest edge of the graph.
+    const double weight = is_current
+                              ? kLoopEdgeWeight
+                              : LoopConstraintWeight(edge.num_inliers,
+                                                     ref_inliers);
+    edges->push_back({edge.map_id,
+                      edge.query_id,
+                      edge.query_from_map,
+                      weight,
+                      weight * graph_options.translation_weight * correction_m});
+  }
+  return num_hist;
+}
+
+void OnlineLoopCloser::RememberLoopConstraint(const LoopConstraint& constraint) {
+  loop_constraints_.erase(
+      std::remove_if(loop_constraints_.begin(),
+                     loop_constraints_.end(),
+                     [&](const LoopConstraint& other) {
+                       return other.map_id == constraint.map_id &&
+                              other.query_id == constraint.query_id;
+                     }),
+      loop_constraints_.end());
+  loop_constraints_.push_back(constraint);
 }
 
 std::vector<image_t> OnlineLoopCloser::LoopMapImages(
