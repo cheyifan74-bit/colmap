@@ -77,6 +77,9 @@ struct OnlineMapperOptions {
   double ba_vio_prior_trans_sigma_m = 0.02;
   double ba_vio_prior_trans_sigma_ratio = 0.03;
   int ba_vio_prior_max_gap = 5;
+  // Loop BA refines the whole pose-graph-corrected chain, so it needs more
+  // iterations than the per-keyframe local BA (fixed at 10).
+  int ba_loop_max_num_iterations = 50;
   // Local BA windows smaller than this (current + covisible frames) are padded
   // with up to `ba_temporal_window_images` most recent registered frames.
   int ba_min_window_images = 4;
@@ -169,10 +172,15 @@ class OnlineMapper {
       const FlatHashSet<point3D_t>& skip_points3D) const;
   // After registration: attach local-map points to unassociated keypoints.
   size_t ExtendTracksByProjection(image_t image_id, const char* stage);
-  size_t AddVioPriorsToLocalBundle(const std::vector<image_t>& image_ids,
-                                   Reconstruction& reconstruction,
-                                   ceres::Problem* problem,
-                                   ceres::LossFunction* loss) const;
+  // Frames whose pose block is missing from `problem` (no observations) are
+  // held constant, unless listed in `free_ids`: those are added as variable
+  // poses constrained by the VIO priors alone.
+  size_t AddVioPriorsToLocalBundle(
+      const std::vector<image_t>& image_ids,
+      Reconstruction& reconstruction,
+      ceres::Problem* problem,
+      ceres::LossFunction* loss,
+      const FlatHashSet<image_t>* free_ids = nullptr) const;
   Rigid3d MapFrameCamFromWorld(image_t image_id, const Rigid3d& vio_prior) const;
   bool RegisterWithRelativeVio(image_t image_id, const Rigid3d& vio_prior);
   image_t FindLastRegisteredWithPrior(image_t image_id) const;

@@ -30,6 +30,7 @@
 #include "colmap/online_sfm/online_mapper.h"
 
 #include "colmap/estimators/bundle_adjustment_ceres.h"
+#include "colmap/estimators/cost_functions/manifold.h"
 #include "colmap/estimators/cost_functions/pose_prior.h"
 #include "colmap/estimators/cost_functions/utils.h"
 #include "colmap/estimators/pose.h"
@@ -58,7 +59,8 @@
 namespace colmap {
 namespace {
 
-BundleAdjustmentOptions MakeLocalBaOptions(const int min_track_length) {
+BundleAdjustmentOptions MakeLocalBaOptions(const int min_track_length,
+                                           const int max_num_iterations = 10) {
   BundleAdjustmentOptions options;
   options.refine_focal_length = false;
   options.refine_principal_point = false;
@@ -70,7 +72,7 @@ BundleAdjustmentOptions MakeLocalBaOptions(const int min_track_length) {
     options.ceres->loss_function_type =
         CeresBundleAdjustmentOptions::LossFunctionType::SOFT_L1;
     options.ceres->loss_function_scale = 1.0;
-    options.ceres->solver_options.max_num_iterations = 10;
+    options.ceres->solver_options.max_num_iterations = max_num_iterations;
     options.ceres->solver_options.logging_type = ceres::LoggingType::SILENT;
   }
   return options;
@@ -1036,7 +1038,8 @@ size_t OnlineMapper::AddVioPriorsToLocalBundle(
     const std::vector<image_t>& image_ids,
     Reconstruction& reconstruction,
     ceres::Problem* problem,
-    ceres::LossFunction* loss) const {
+    ceres::LossFunction* loss,
+    const FlatHashSet<image_t>* free_ids) const {
   if (options_.ba_vio_prior_rot_sigma_deg <= 0.0 || problem == nullptr) {
     return 0;
   }
@@ -1062,11 +1065,20 @@ size_t OnlineMapper::AddVioPriorsToLocalBundle(
         reconstruction.Image(id_i).FramePtr()->RigFromWorld().params.data();
     double* params_j =
         reconstruction.Image(id_j).FramePtr()->RigFromWorld().params.data();
-    // Blocks missing from the problem belong to constant-pose frames.
+    // Blocks missing from the problem belong to constant-pose frames, except
+    // `free_ids` frames, which enter the problem here as variable poses.
     const bool has_i = problem->HasParameterBlock(params_i);
     const bool has_j = problem->HasParameterBlock(params_j);
-    if (!has_i && !has_j) {
+    const bool free_i = !has_i && free_ids != nullptr && free_ids->count(id_i) > 0;
+    const bool free_j = !has_j && free_ids != nullptr && free_ids->count(id_j) > 0;
+    if (!has_i && !has_j && !free_i && !free_j) {
       continue;
+    }
+    if (free_i) {
+      reconstruction.Image(id_i).FramePtr()->RigFromWorld().rotation().normalize();
+    }
+    if (free_j) {
+      reconstruction.Image(id_j).FramePtr()->RigFromWorld().rotation().normalize();
     }
     const Rigid3d i_from_j_prior =
         pose_priors_.at(id_i) * Inverse(pose_priors_.at(id_j));
@@ -1083,11 +1095,21 @@ size_t OnlineMapper::AddVioPriorsToLocalBundle(
         loss,
         params_i,
         params_j);
+    const auto SetNewBlock = [&](double* params, const bool is_free) {
+      if (is_free) {
+        SetManifold(problem,
+                    params,
+                    CreateProductManifold(CreateEigenQuaternionManifold(),
+                                          CreateEuclideanManifold<3>()));
+      } else {
+        problem->SetParameterBlockConstant(params);
+      }
+    };
     if (!has_i) {
-      problem->SetParameterBlockConstant(params_i);
+      SetNewBlock(params_i, free_i);
     }
     if (!has_j) {
-      problem->SetParameterBlockConstant(params_j);
+      SetNewBlock(params_j, free_j);
     }
     ++num_priors;
   }
@@ -1314,17 +1336,50 @@ void OnlineMapper::AdjustLoopBundle(const std::vector<image_t>& variable_ids,
     return;
   }
 
-  auto bundle_adjuster = CreateDefaultBundleAdjuster(
-      MakeLocalBaOptions(0), ba_config, *reconstruction_);
+  // Problem does not own loss functions; must outlive the solve.
+  const auto prior_loss =
+      std::make_unique<ceres::HuberLoss>(std::sqrt(kChiSquare95ThreeDof * 2.0));
+  auto bundle_adjuster = CreateDefaultCeresBundleAdjuster(
+      MakeLocalBaOptions(0, options_.ba_loop_max_num_iterations),
+      ba_config,
+      *reconstruction_);
+  // Weak-texture frames have few or no observations; the VIO priors keep them
+  // rigidly attached to their neighbours while the chain is refined.
+  // Frames just before the chain stay fixed and tie its start to the old
+  // trajectory, as the boundary node does in the pose graph.
+  std::vector<image_t> prior_ids = used_variable;
+  const image_t chain_front =
+      *std::min_element(used_variable.begin(), used_variable.end());
+  const image_t max_gap =
+      static_cast<image_t>(std::max(options_.ba_vio_prior_max_gap, 1));
+  for (image_t id = chain_front > max_gap ? chain_front - max_gap : 1;
+       id < chain_front;
+       ++id) {
+    if (reconstruction_->ExistsImage(id) &&
+        reconstruction_->Image(id).HasPose()) {
+      prior_ids.push_back(id);
+    }
+  }
+  const FlatHashSet<image_t> free_ids(used_variable.begin(),
+                                      used_variable.end());
+  const size_t num_vio_priors =
+      AddVioPriorsToLocalBundle(prior_ids,
+                                *reconstruction_,
+                                bundle_adjuster->Problem().get(),
+                                prior_loss.get(),
+                                &free_ids);
   const auto summary = bundle_adjuster->Solve();
   if (!summary || !summary->IsSolutionUsable()) {
     LOG(WARNING) << "OnlineMapper: loop BA failed, variable="
-                 << JoinImageIds(used_variable);
+                 << JoinImageIds(used_variable)
+                 << " vio_priors=" << num_vio_priors;
     return;
   }
   LOG(INFO) << "OnlineMapper: loop BA variable=[" << JoinImageIds(used_variable)
             << "] anchors=" << num_anchors
             << " points=" << variable_point3D_ids.size()
+            << " vio_priors=" << num_vio_priors
+            << " max_iterations=" << options_.ba_loop_max_num_iterations
             << " residuals=" << summary->num_residuals;
 
   triangulator_->MergeTracks(options_.triangulation, variable_point3D_ids);
