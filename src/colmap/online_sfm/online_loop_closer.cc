@@ -60,10 +60,10 @@
 namespace colmap {
 namespace {
 
-// Loop edge vs odometry edges in the pose graph (residual scale).
-constexpr double kLoopEdgeWeight = 10.0;
-// Inlier scale never drops the loop weight below this fraction.
-constexpr double kMinLoopEdgeWeightScale = 0.3;
+// Keypoint noise behind the loop PnP covariance.
+constexpr double kLoopPixelSigma = 1.0;
+// PnP covariance treats map points as exact; inflate the loop edge sigma.
+constexpr double kLoopSigmaInflation = 2.0;
 // Historical edges whose residual is farther than this multiple of the
 // correction gate are treated as broken measurements and left out.
 constexpr double kHistoricalResidualFactor = 2.0;
@@ -184,6 +184,71 @@ std::vector<char> ComputePnPInliers(const std::vector<LoopPnPCorr>& corrs,
     inliers[i] = err <= max_sq ? 1 : 0;
   }
   return inliers;
+}
+
+// Isotropic 1-sigma of the PnP pose from the Gauss-Newton information of the
+// inlier reprojections, with a left perturbation [w, v] of cam_from_world.
+// The rotation sigma covers w; the translation sigma covers the camera center
+// in any fixed frame, which only moves with v.
+bool EstimatePnPSigmas(const std::vector<LoopPnPCorr>& corrs,
+                       const std::vector<char>& inliers,
+                       const Reconstruction& reconstruction,
+                       const Rigid3d& cam_from_world,
+                       const Camera& camera,
+                       double* rot_sigma,
+                       double* trans_sigma) {
+  Eigen::Matrix<double, 6, 6> H = Eigen::Matrix<double, 6, 6>::Zero();
+  size_t num_used = 0;
+  for (size_t i = 0; i < corrs.size(); ++i) {
+    if (!inliers[i] || !reconstruction.ExistsPoint3D(corrs[i].point3D_id)) {
+      continue;
+    }
+    const Eigen::Vector3d xyz_cam =
+        cam_from_world * reconstruction.Point3D(corrs[i].point3D_id).xyz;
+    const auto proj = ProjectCam(camera, xyz_cam);
+    if (!proj) {
+      continue;
+    }
+    const double h = 1e-6 * std::max(1.0, xyz_cam.norm());
+    Eigen::Matrix<double, 2, 3> J_proj;
+    bool ok = true;
+    for (int a = 0; a < 3 && ok; ++a) {
+      Eigen::Vector3d xyz_h = xyz_cam;
+      xyz_h[a] += h;
+      const auto proj_h = ProjectCam(camera, xyz_h);
+      ok = proj_h.has_value();
+      if (ok) {
+        J_proj.col(a) = (*proj_h - *proj) / h;
+      }
+    }
+    if (!ok) {
+      continue;
+    }
+    Eigen::Matrix<double, 3, 6> J_xyz;
+    J_xyz.leftCols<3>() << 0.0, xyz_cam.z(), -xyz_cam.y(),
+        -xyz_cam.z(), 0.0, xyz_cam.x(),
+        xyz_cam.y(), -xyz_cam.x(), 0.0;
+    J_xyz.rightCols<3>().setIdentity();
+    const Eigen::Matrix<double, 2, 6> J = J_proj * J_xyz;
+    H += J.transpose() * J;
+    ++num_used;
+  }
+  if (num_used < 6) {
+    return false;
+  }
+  const Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> eig_h(H);
+  if (eig_h.info() != Eigen::Success || !(eig_h.eigenvalues()(0) > 1e-9)) {
+    return false;
+  }
+  const Eigen::Matrix<double, 6, 6> cov =
+      kLoopPixelSigma * kLoopPixelSigma * H.inverse();
+  const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_rot(
+      cov.topLeftCorner<3, 3>());
+  const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_trans(
+      cov.bottomRightCorner<3, 3>());
+  *rot_sigma = std::sqrt(std::max(eig_rot.eigenvalues()(2), 0.0));
+  *trans_sigma = std::sqrt(std::max(eig_trans.eigenvalues()(2), 0.0));
+  return true;
 }
 
 // Project loop-map points with the PnP pose into the current image and take
@@ -1040,6 +1105,30 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
     return false;
   }
 
+  double pnp_rot_sigma = 0.0;
+  double pnp_trans_sigma = 0.0;
+  const bool has_pnp_sigma = EstimatePnPSigmas(corrs,
+                                               inliers,
+                                               reconstruction,
+                                               cam_from_world,
+                                               camera,
+                                               &pnp_rot_sigma,
+                                               &pnp_trans_sigma);
+  const double min_rot_sigma =
+      DegToRad(std::max(options_.pose_graph_loop_min_rot_sigma_deg, 1e-3));
+  const double min_trans_sigma =
+      std::max(options_.pose_graph_loop_min_trans_sigma_m, 1e-4);
+  // Degenerate PnP information: keep the loop but trust it like odometry.
+  loop_pair->rot_sigma =
+      has_pnp_sigma
+          ? std::max(kLoopSigmaInflation * pnp_rot_sigma, min_rot_sigma)
+          : DegToRad(std::max(options_.pose_graph_odom_rot_sigma_deg, 1e-3));
+  loop_pair->trans_sigma =
+      has_pnp_sigma
+          ? std::max(kLoopSigmaInflation * pnp_trans_sigma, min_trans_sigma)
+          : std::max(options_.pose_graph_odom_trans_sigma_m, 1e-4) +
+                options_.pose_graph_odom_trans_sigma_ratio * baseline_m;
+
   loop_pair->has_loop_pose = true;
   loop_pair->loop_cam_from_world = cam_from_world;
   loop_pair->loop_observations.clear();
@@ -1053,7 +1142,11 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
   LOG(INFO) << "OnlineLoopCloser: accept " << image_id << "-" << candidate_id
             << " by pnp inliers=" << num_pnp_inliers
             << " correction_m=" << loop_pair->correction_m
-            << " correction_deg=" << loop_pair->correction_deg;
+            << " correction_deg=" << loop_pair->correction_deg
+            << " pnp_sigma_deg=" << RadToDeg(pnp_rot_sigma)
+            << " pnp_sigma_m=" << pnp_trans_sigma
+            << " edge_sigma_deg=" << RadToDeg(loop_pair->rot_sigma)
+            << " edge_sigma_m=" << loop_pair->trans_sigma;
   return true;
 }
 
@@ -1453,7 +1546,7 @@ bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
     return false;
   }
 
-  // Stage A: SE3 pose graph (odometry + covisibility + loop edges).
+  // Stage A: pose graph (odometry + covisibility + loop edges).
   std::unordered_map<image_t, Rigid3d> poses_old;
   for (const image_t id : variable_ids) {
     poses_old[id] = reconstruction.Image(id).CamFromWorld();
@@ -1470,7 +1563,7 @@ bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
   image_t prev_id = boundary_id;
   for (const image_t id : variable_ids) {
     if (prev_id != kInvalidImageId) {
-      edges.push_back({prev_id, id, Rel(prev_id, id), 1.0});
+      edges.push_back(MakeOdometryEdge(prev_id, id, Rel(prev_id, id), 1.0));
     }
     prev_id = id;
   }
@@ -1488,11 +1581,18 @@ bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
       if (count < options_.pose_graph_min_covis) {
         continue;
       }
+      // More shared points, tighter edge; at most 2x tighter than odometry.
+      const double covis_scale = std::clamp(
+          std::sqrt(static_cast<double>(std::max(options_.pose_graph_min_covis, 1)) /
+                    static_cast<double>(count)),
+          0.5,
+          1.0);
       if (variable_set.count(other_id) > 0) {
         if (other_id <= id) {
           continue;
         }
-        edges.push_back({id, other_id, Rel(id, other_id), 1.0});
+        edges.push_back(
+            MakeOdometryEdge(id, other_id, Rel(id, other_id), covis_scale));
         ++num_covis_edges;
         continue;
       }
@@ -1504,7 +1604,8 @@ bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
         poses_old[other_id] = reconstruction.Image(other_id).CamFromWorld();
       }
       fixed_ids.insert(other_id);
-      edges.push_back({other_id, id, Rel(other_id, id), 1.0});
+      edges.push_back(
+          MakeOdometryEdge(other_id, id, Rel(other_id, id), covis_scale));
       ++num_old_covis_edges;
     }
   }
@@ -1514,24 +1615,73 @@ bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
       loop_id,
       current_id,
       loop_pair.loop_cam_from_world * Inverse(poses_old[loop_id]),
-      loop_pair.loop_observations.size()};
-  const PoseGraphOptions graph_options;
-  const size_t num_hist_loop_edges = AppendLoopEdges(reconstruction,
-                                                     variable_set,
-                                                     current_loop,
-                                                     graph_options,
-                                                     &poses_old,
-                                                     &fixed_ids,
-                                                     &edges);
+      loop_pair.loop_observations.size(),
+      loop_pair.rot_sigma,
+      loop_pair.trans_sigma};
+  const size_t loop_edge_begin = edges.size();
+  std::vector<LoopConstraint> loop_edge_constraints;
+  size_t num_hist_loop_edges = AppendLoopEdges(reconstruction,
+                                               variable_set,
+                                               current_loop,
+                                               &poses_old,
+                                               &fixed_ids,
+                                               &edges,
+                                               &loop_edge_constraints);
 
-  std::unordered_map<image_t, Rigid3d> poses = poses_old;
-  const PoseGraphSummary pg =
-      OptimizeSE3PoseGraph(graph_options, edges, fixed_ids, &poses);
-  if (!pg.success) {
-    LOG(WARNING) << "OnlineLoopCloser: CorrectLoop pose graph failed "
-                 << current_id << "-" << loop_id << " nodes=" << pg.num_nodes
-                 << " edges=" << pg.num_edges;
-    return false;
+  // Solve, then drop the historical loop edge most inconsistent with the rest
+  // (whitened chi-square above the 99% quantile) and solve again. If the
+  // current loop is the outlier, the correction is rejected.
+  const PoseGraphOptions graph_options = MakePoseGraphOptions();
+  const double outlier_chi2 = PoseGraphEdgeChi2Quantile(graph_options, 0.99);
+  std::unordered_map<image_t, Rigid3d> poses;
+  PoseGraphSummary pg;
+  size_t num_dropped_loop_edges = 0;
+  std::vector<LoopConstraint> dropped_loop_constraints;
+  double current_loop_chi2 = -1.0;
+  while (true) {
+    poses = poses_old;
+    pg = OptimizePoseGraph(graph_options, edges, fixed_ids, &poses);
+    if (!pg.success) {
+      LOG(WARNING) << "OnlineLoopCloser: CorrectLoop pose graph failed "
+                   << current_id << "-" << loop_id << " nodes=" << pg.num_nodes
+                   << " edges=" << pg.num_edges;
+      return false;
+    }
+    size_t worst = edges.size();
+    double worst_chi2 = outlier_chi2;
+    for (size_t k = loop_edge_begin; k < edges.size(); ++k) {
+      const LoopConstraint& c = loop_edge_constraints[k - loop_edge_begin];
+      if (c.map_id == current_loop.map_id &&
+          c.query_id == current_loop.query_id) {
+        current_loop_chi2 = pg.edge_chi2[k];
+      }
+      if (pg.edge_chi2[k] > worst_chi2) {
+        worst_chi2 = pg.edge_chi2[k];
+        worst = k;
+      }
+    }
+    if (worst == edges.size()) {
+      break;
+    }
+    const LoopConstraint outlier = loop_edge_constraints[worst - loop_edge_begin];
+    if (outlier.map_id == current_loop.map_id &&
+        outlier.query_id == current_loop.query_id) {
+      LOG(WARNING) << "OnlineLoopCloser: CorrectLoop reject " << current_id
+                   << "-" << loop_id << ", loop edge chi2=" << worst_chi2
+                   << " > " << outlier_chi2
+                   << " against odometry and historical loops";
+      return false;
+    }
+    LOG(INFO) << "OnlineLoopCloser: drop historical loop " << outlier.query_id
+              << "-" << outlier.map_id << " chi2=" << worst_chi2 << " > "
+              << outlier_chi2;
+    dropped_loop_constraints.push_back(outlier);
+    edges.erase(edges.begin() + static_cast<std::ptrdiff_t>(worst));
+    loop_edge_constraints.erase(
+        loop_edge_constraints.begin() +
+        static_cast<std::ptrdiff_t>(worst - loop_edge_begin));
+    --num_hist_loop_edges;
+    ++num_dropped_loop_edges;
   }
   const Rigid3d& cur_after = poses.at(current_id);
   const double cur_vs_pnp_m = (cur_after.TgtOriginInSrc() -
@@ -1687,6 +1837,9 @@ bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
             << " edges=" << pg.num_edges << " covis_edges=" << num_covis_edges
             << " old_covis_edges=" << num_old_covis_edges
             << " hist_loop_edges=" << num_hist_loop_edges
+            << " dropped_loop_edges=" << num_dropped_loop_edges
+            << " loop_chi2=" << current_loop_chi2
+            << " dof=" << (graph_options.four_dof ? 4 : 6)
             << " fixed_nodes=" << fixed_ids.size()
             << " cost=" << pg.initial_cost << "->" << pg.final_cost
             << " cur_vs_pnp_m=" << cur_vs_pnp_m
@@ -1705,6 +1858,9 @@ bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
             << *std::max_element(connected.begin(), connected.end()) << "]";
   if (num_poses_corrected == 0) {
     return false;
+  }
+  for (const LoopConstraint& dropped : dropped_loop_constraints) {
+    ForgetLoopConstraint(dropped.map_id, dropped.query_id);
   }
   RememberLoopConstraint(current_loop);
   return true;
@@ -1749,18 +1905,28 @@ void OnlineLoopCloser::FuseAfterLoopBA(Reconstruction& reconstruction,
             << " fuse_rejected_desc=" << proj.num_rejected_desc;
 }
 
-double OnlineLoopCloser::LoopConstraintWeight(const size_t num_inliers,
-                                              const size_t ref_inliers) const {
-  // Provisional information ~ sqrt(inliers); the strongest edge of this graph
-  // gets the full loop weight and weaker ones a fraction of it.
-  if (num_inliers == 0 || ref_inliers == 0) {
-    return kLoopEdgeWeight * kMinLoopEdgeWeightScale;
-  }
-  const double ratio = static_cast<double>(num_inliers) /
-                       static_cast<double>(ref_inliers);
-  const double scale =
-      std::clamp(std::sqrt(ratio), kMinLoopEdgeWeightScale, 1.0);
-  return kLoopEdgeWeight * scale;
+PoseGraphOptions OnlineLoopCloser::MakePoseGraphOptions() const {
+  PoseGraphOptions graph_options;
+  graph_options.four_dof = options_.pose_graph_4dof;
+  return graph_options;
+}
+
+PoseGraphEdge OnlineLoopCloser::MakeOdometryEdge(const image_t i,
+                                                 const image_t j,
+                                                 const Rigid3d& j_from_i,
+                                                 const double sigma_scale) const {
+  PoseGraphEdge edge;
+  edge.image_id_i = i;
+  edge.image_id_j = j;
+  edge.j_from_i = j_from_i;
+  edge.rot_sigma =
+      sigma_scale *
+      DegToRad(std::max(options_.pose_graph_odom_rot_sigma_deg, 1e-3));
+  edge.trans_sigma =
+      sigma_scale * (std::max(options_.pose_graph_odom_trans_sigma_m, 1e-4) +
+                     options_.pose_graph_odom_trans_sigma_ratio *
+                         j_from_i.translation().norm());
+  return edge;
 }
 
 bool OnlineLoopCloser::SameLoopCluster(
@@ -1799,10 +1965,10 @@ size_t OnlineLoopCloser::AppendLoopEdges(
     const Reconstruction& reconstruction,
     const std::unordered_set<image_t>& variable_set,
     const LoopConstraint& current,
-    const PoseGraphOptions& graph_options,
     std::unordered_map<image_t, Rigid3d>* poses_old,
     std::unordered_set<image_t>* fixed_ids,
-    std::vector<PoseGraphEdge>* edges) {
+    std::vector<PoseGraphEdge>* edges,
+    std::vector<LoopConstraint>* edge_constraints) {
   std::vector<LoopConstraint> replay;
   replay.reserve(loop_constraints_.size());
   for (const LoopConstraint& stored : loop_constraints_) {
@@ -1874,11 +2040,6 @@ size_t OnlineLoopCloser::AppendLoopEdges(
     ++num_hist;
   }
 
-  const double correction_m = std::max(options_.max_correction_m, 1.0);
-  size_t ref_inliers = 0;
-  for (const LoopConstraint& edge : selected) {
-    ref_inliers = std::max(ref_inliers, edge.num_inliers);
-  }
   for (const LoopConstraint& edge : selected) {
     if (poses_old->count(edge.map_id) == 0 &&
         reconstruction.ExistsImage(edge.map_id) &&
@@ -1893,21 +2054,29 @@ size_t OnlineLoopCloser::AppendLoopEdges(
     if (variable_set.count(edge.map_id) == 0) {
       fixed_ids->insert(edge.map_id);
     }
-    const bool is_current =
-        edge.map_id == current.map_id && edge.query_id == current.query_id;
-    // This correction keeps its full weight; historical edges are scaled
-    // against the strongest edge of the graph.
-    const double weight = is_current
-                              ? kLoopEdgeWeight
-                              : LoopConstraintWeight(edge.num_inliers,
-                                                     ref_inliers);
-    edges->push_back({edge.map_id,
-                      edge.query_id,
-                      edge.query_from_map,
-                      weight,
-                      weight * graph_options.translation_weight * correction_m});
+    PoseGraphEdge loop_edge =
+        MakeOdometryEdge(edge.map_id, edge.query_id, edge.query_from_map, 1.0);
+    if (edge.rot_sigma > 0.0 && edge.trans_sigma > 0.0) {
+      loop_edge.rot_sigma = edge.rot_sigma;
+      loop_edge.trans_sigma = edge.trans_sigma;
+    }
+    loop_edge.robust = true;
+    edges->push_back(loop_edge);
+    edge_constraints->push_back(edge);
   }
   return num_hist;
+}
+
+void OnlineLoopCloser::ForgetLoopConstraint(const image_t map_id,
+                                            const image_t query_id) {
+  loop_constraints_.erase(
+      std::remove_if(loop_constraints_.begin(),
+                     loop_constraints_.end(),
+                     [&](const LoopConstraint& other) {
+                       return other.map_id == map_id &&
+                              other.query_id == query_id;
+                     }),
+      loop_constraints_.end());
 }
 
 void OnlineLoopCloser::RememberLoopConstraint(const LoopConstraint& constraint) {

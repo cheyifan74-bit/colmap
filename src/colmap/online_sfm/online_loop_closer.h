@@ -91,6 +91,17 @@ struct OnlineLoopCloserOptions {
   double max_correction_deg = 20.0;
   // Covisibility edges in the pose graph need at least this many shared points.
   int pose_graph_min_covis = 50;
+  // x, y, z + yaw per node (roll / pitch observable from the IMU). The map
+  // world frame must be the gravity-aligned VIO frame (+z up).
+  bool pose_graph_4dof = true;
+  // Odometry / covisibility edge 1-sigma; translation grows with step length.
+  double pose_graph_odom_rot_sigma_deg = 1.0;
+  double pose_graph_odom_trans_sigma_m = 0.02;
+  double pose_graph_odom_trans_sigma_ratio = 0.03;
+  // Lower bounds on the loop edge 1-sigma taken from the PnP covariance, which
+  // ignores 3D point error.
+  double pose_graph_loop_min_rot_sigma_deg = 0.2;
+  double pose_graph_loop_min_trans_sigma_m = 0.02;
   // Projection fusion after correction.
   double fuse_radius_px = 6.0;
   double fuse_max_point_distance = 0.2;
@@ -120,6 +131,9 @@ struct OnlineLoopPair {
   double correction_m = 0.0;
   double correction_deg = 0.0;
   double rot_vs_essential_deg = -1.0;
+  // Loop edge 1-sigma (radians / meters) from the PnP covariance.
+  double rot_sigma = 0.0;
+  double trans_sigma = 0.0;
   // PnP inliers: (current point2D idx, loop-side point3D id).
   std::vector<std::pair<point2D_t, point3D_t>> loop_observations;
 };
@@ -235,9 +249,16 @@ class OnlineLoopCloser {
     image_t query_id = kInvalidImageId;
     Rigid3d query_from_map;
     size_t num_inliers = 0;
+    double rot_sigma = 0.0;
+    double trans_sigma = 0.0;
   };
 
-  double LoopConstraintWeight(size_t num_inliers, size_t ref_inliers) const;
+  PoseGraphOptions MakePoseGraphOptions() const;
+  // Odometry / covisibility edge from the pre-correction relative pose.
+  PoseGraphEdge MakeOdometryEdge(image_t i,
+                                 image_t j,
+                                 const Rigid3d& j_from_i,
+                                 double sigma_scale) const;
   // Queries within the cooldown and map frames in one covisibility group are
   // the same place. The pose graph keeps a single edge per cluster.
   bool SameLoopCluster(image_t query_a,
@@ -248,15 +269,17 @@ class OnlineLoopCloser {
   bool HistoricalResidualPlausible(const Rigid3d& measured,
                                    const Rigid3d& current_rel) const;
   // Adds `current` plus historical constraints whose query frame is still in
-  // `variable_set`. Returns how many historical edges were added.
+  // `variable_set`. Appends the loop edges' constraints to `edge_constraints`
+  // in edge order. Returns how many historical edges were added.
   size_t AppendLoopEdges(const Reconstruction& reconstruction,
                          const std::unordered_set<image_t>& variable_set,
                          const LoopConstraint& current,
-                         const PoseGraphOptions& graph_options,
                          std::unordered_map<image_t, Rigid3d>* poses_old,
                          std::unordered_set<image_t>* fixed_ids,
-                         std::vector<PoseGraphEdge>* edges);
+                         std::vector<PoseGraphEdge>* edges,
+                         std::vector<LoopConstraint>* edge_constraints);
   void RememberLoopConstraint(const LoopConstraint& constraint);
+  void ForgetLoopConstraint(image_t map_id, image_t query_id);
 
   std::string database_path_;
   OnlineLoopCloserOptions options_;
