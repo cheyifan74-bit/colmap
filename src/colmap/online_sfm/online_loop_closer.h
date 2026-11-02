@@ -84,6 +84,12 @@ struct OnlineLoopCloserOptions {
   double pnp_max_error = 3.0;
   // Guided projection search radius when growing PnP matches (pixels).
   double guided_radius_px = 7.5;
+  // When the candidate alone gives too few 2D-3D pairs, descriptor-match the
+  // current frame against the 3D points of the candidate's covisibility
+  // island, keeping matches near the candidate-current epipolar plane.
+  bool island_2d3d = true;
+  // Epipolar gate of the island matches (pixels at the mean focal length).
+  double island_epipolar_px = 4.0;
   // Loop rotation (PnP) vs essential-matrix rotation; <=0 disables.
   double max_rot_vs_essential_deg = 3.0;
   // Reject loops whose correction of the current pose is larger than this.
@@ -102,6 +108,15 @@ struct OnlineLoopCloserOptions {
   // ignores 3D point error.
   double pose_graph_loop_min_rot_sigma_deg = 0.2;
   double pose_graph_loop_min_trans_sigma_m = 0.02;
+  // Trajectory prior check (ROVER, arXiv 2508.13488): align the camera
+  // centers of the frames between loop and current frame before / after the
+  // pose graph (yaw + translation, or SE3 in 6-DoF mode) and reject the loop
+  // when the remaining RMSE exceeds
+  // max(rover_min_threshold_m, rover_threshold_ratio * path length).
+  // A true loop bends the trajectory smoothly; a false one tears it apart.
+  bool rover_enabled = true;
+  double rover_min_threshold_m = 0.5;
+  double rover_threshold_ratio = 0.01;
   // Projection fusion after correction.
   double fuse_radius_px = 6.0;
   double fuse_max_point_distance = 0.2;
