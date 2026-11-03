@@ -39,6 +39,10 @@
 
 #include <algorithm>
 #include <exception>
+#include <filesystem>
+#include <fstream>
+#include <set>
+#include <sstream>
 #include <vector>
 
 namespace colmap {
@@ -66,6 +70,42 @@ OnlineIncrementalMapper::OnlineIncrementalMapper(
       database_cache_, sparse_path_, std::move(mapper_options));
   loop_closer_ = std::make_unique<OnlineLoopCloser>(database_path_,
                                                     std::move(loop_options));
+  mapper_->SetDescriptorLoader(
+      [this](const image_t image_id) -> std::shared_ptr<const FeatureDescriptors> {
+        try {
+          DatabaseSession session(database_path_);
+          if (!session->ExistsDescriptors(image_id)) {
+            return nullptr;
+          }
+          return std::make_shared<const FeatureDescriptors>(
+              session->ReadDescriptors(image_id));
+        } catch (const std::exception& e) {
+          LOG(WARNING) << "OnlineIncrementalMapper: failed to load descriptors "
+                          "of image "
+                       << image_id << ": " << e.what();
+          return nullptr;
+        }
+      });
+  mapper_->SetKeypointLoader(
+      [this](const image_t image_id) -> std::shared_ptr<const FeatureKeypoints> {
+        try {
+          DatabaseSession session(database_path_);
+          if (!session->ExistsKeypoints(image_id)) {
+            return nullptr;
+          }
+          return std::make_shared<const FeatureKeypoints>(
+              session->ReadKeypoints(image_id));
+        } catch (const std::exception& e) {
+          LOG(WARNING) << "OnlineIncrementalMapper: failed to load keypoints "
+                          "of image "
+                       << image_id << ": " << e.what();
+          return nullptr;
+        }
+      });
+  loop_closer_->SetVioRelativePose(
+      [this](const image_t tgt_id, const image_t src_id) {
+        return mapper_->VioRelativePose(tgt_id, src_id);
+      });
 }
 
 OnlineIncrementalMapper::~OnlineIncrementalMapper() = default;
@@ -397,6 +437,10 @@ bool OnlineIncrementalMapper::ResumeFromDisk() {
             image_id,
             std::make_shared<const FeatureDescriptors>(
                 session->ReadDescriptors(image_id)));
+        if (session->ExistsKeypoints(image_id)) {
+          mapper_->CacheKeypointScales(image_id,
+                                       session->ReadKeypoints(image_id));
+        }
         ++num_cached_desc;
       }
     } catch (const std::exception& e) {
@@ -459,6 +503,7 @@ bool OnlineIncrementalMapper::Process(
     matcher_->CacheFeatures(
         image_id, extracted.keypoints, extracted.descriptors);
     mapper_->CacheDescriptors(image_id, extracted.descriptors);
+    mapper_->CacheKeypointScales(image_id, *extracted.keypoints);
   }
 
   if (!IngestImage(image_id)) {
@@ -485,9 +530,14 @@ bool OnlineIncrementalMapper::Process(
   if (!mapper_->MappingCurrentImage(image_id, cam_from_world_prior)) {
     return false;
   }
+  if (mapper_->LastFrameSkipped()) {
+    matcher_->ForgetImage(image_id);
+    return true;
+  }
 
+  bool corrected = false;
   if (loop_closer_ && loop_closer_->IsLoopClosureActive()) {
-    const bool corrected = loop_closer_->Process(
+    corrected = loop_closer_->Process(
         image_id,
         image_abs_path,
         *database_cache_,
@@ -504,7 +554,87 @@ bool OnlineIncrementalMapper::Process(
     }
   }
 
+  // The loop BA window and fusion just used the frames around the loop.
+  if (!corrected) {
+    std::unordered_set<image_t> protected_ids;
+    if (loop_closer_) {
+      loop_closer_->CollectProtectedImageIds(&protected_ids);
+    }
+    for (const image_t culled_id :
+         mapper_->CullRedundantKeyframes(image_id, protected_ids)) {
+      matcher_->ForgetImage(culled_id);
+    }
+    for (const image_t evicted_id :
+         mapper_->EnforceSpatialCapacity(image_id, protected_ids)) {
+      matcher_->ForgetImage(evicted_id);
+    }
+  }
+
   return true;
+}
+
+size_t OnlineIncrementalMapper::CompactDatabase(
+    std::vector<std::string>* removed_names) {
+  if (sparse_path_.empty() || database_path_.empty()) {
+    return 0;
+  }
+  const std::filesystem::path record_path =
+      std::filesystem::path(sparse_path_).parent_path() /
+      "culled_keyframes.txt";
+  if (!std::filesystem::exists(record_path)) {
+    return 0;
+  }
+
+  std::set<image_t> image_ids;
+  {
+    std::ifstream file(record_path);
+    std::string line;
+    while (std::getline(file, line)) {
+      if (line.empty() || line[0] == '#') {
+        continue;
+      }
+      std::istringstream iss(line);
+      image_t image_id = kInvalidImageId;
+      if (iss >> image_id) {
+        image_ids.insert(image_id);
+      }
+    }
+  }
+
+  // A frame culled after the last flush of a crashed session is still in the
+  // sparse model on disk; the resumed map keeps it.
+  const Reconstruction& reconstruction = mapper_->GetReconstruction();
+  size_t num_removed = 0;
+  try {
+    DatabaseSession session(database_path_);
+    Database* database = session.get();
+    database->BeginTransaction();
+    for (const image_t image_id : image_ids) {
+      if ((reconstruction.ExistsImage(image_id) &&
+           reconstruction.Image(image_id).HasPose()) ||
+          !database->ExistsImage(image_id)) {
+        continue;
+      }
+      if (removed_names != nullptr) {
+        removed_names->push_back(database->ReadImage(image_id).Name());
+      }
+      database->DeleteImageData(image_id);
+      ++num_removed;
+    }
+    database->EndTransaction();
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "OnlineIncrementalMapper: database compaction failed: "
+               << e.what();
+    if (removed_names != nullptr) {
+      removed_names->clear();
+    }
+    return 0;
+  }
+  std::filesystem::remove(record_path);
+  LOG(INFO) << "OnlineIncrementalMapper: compacted database, removed "
+            << num_removed << " culled image(s) of " << image_ids.size()
+            << " record(s)";
+  return num_removed;
 }
 
 bool OnlineIncrementalMapper::LocalizeCurrent(

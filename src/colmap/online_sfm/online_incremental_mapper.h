@@ -88,6 +88,12 @@ class OnlineIncrementalMapper {
   // Flush the sparse model unconditionally (used on shutdown).
   void FlushSparse();
 
+  // Delete the database rows of every culled / dropped keyframe recorded in
+  // culled_keyframes.txt that is not registered, then remove the record.
+  // Call after FlushSparse. `removed_names` receives the deleted image names
+  // so the caller can delete the image files. Returns the number removed.
+  size_t CompactDatabase(std::vector<std::string>* removed_names);
+
   const std::shared_ptr<DatabaseCache>& GetDatabaseCache() const {
     return database_cache_;
   }

@@ -57,6 +57,9 @@ class ObservationManager {
     size_t num_tri_corrs = 0;
     // The number of total correspondences/matches between two images.
     size_t num_total_corrs = 0;
+    // Whether the correspondences of this pair are reflected in
+    // num_visible_correspondences of both images.
+    bool visibility_counted = false;
   };
 
   explicit ObservationManager(class Reconstruction& reconstruction,

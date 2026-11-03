@@ -93,6 +93,8 @@ class OnlineFeatureMatcher {
                      std::shared_ptr<const FeatureKeypoints> keypoints,
                      std::shared_ptr<const FeatureDescriptors> descriptors);
   void PutPosePrior(image_t image_id, const Rigid3d& cam_from_world);
+  // Culled keyframe: never select it as a matching partner again.
+  void ForgetImage(image_t image_id);
 
   bool MatchAndWrite(image_t image_id, const DatabaseCache& cache);
 
@@ -142,6 +144,7 @@ class OnlineFeatureMatcher {
   std::unordered_map<image_t, FeatureCacheEntry> feature_cache_;
   std::deque<image_t> feature_cache_order_;
   std::unordered_map<image_t, Rigid3d> pose_priors_;
+  std::unordered_set<image_t> forgotten_ids_;
   std::vector<image_t> last_temporal_ids_;
   std::vector<image_t> last_spatial_ids_;
   std::vector<image_t> last_candidate_ids_;

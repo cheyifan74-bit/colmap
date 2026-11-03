@@ -39,7 +39,9 @@
 #include "colmap/util/eigen_alignment.h"
 #include "colmap/util/types.h"
 
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -70,6 +72,9 @@ struct OnlineLoopCloserOptions {
   double min_mixvpr_score = 0.4;
   int topk = 5;
   int min_covisibility_points = 15;
+  // Candidates with fewer 3D points are weakly constrained themselves and
+  // become the fixed node of the correction. 0 disables.
+  int min_candidate_points = 0;
   int min_num_matches = 20;
   // PnP inliers after guided projection matching.
   int min_num_verified_matches = 40;
@@ -84,6 +89,11 @@ struct OnlineLoopCloserOptions {
   double pnp_max_error = 3.0;
   // Guided projection search radius when growing PnP matches (pixels).
   double guided_radius_px = 7.5;
+  // Feature scale consistency of the PnP pose: a 2D-3D pair whose keypoint
+  // scale differs from the scale predicted by the loop-side observations
+  // (s = f * S / range) by more than this factor is not an inlier, and guided
+  // matching skips such keypoints. <= 1 disables.
+  double scale_check_max_ratio = 0.0;
   // When the candidate alone gives too few 2D-3D pairs, descriptor-match the
   // current frame against the 3D points of the candidate's covisibility
   // island, keeping matches near the candidate-current epipolar plane.
@@ -100,6 +110,9 @@ struct OnlineLoopCloserOptions {
   // x, y, z + yaw per node (roll / pitch observable from the IMU). The map
   // world frame must be the gravity-aligned VIO frame (+z up).
   bool pose_graph_4dof = true;
+  // Odometry edges take the VIO relative pose where both frames have one,
+  // instead of the current map poses (which may already be distorted).
+  bool pose_graph_vio_odometry = false;
   // Odometry / covisibility edge 1-sigma; translation grows with step length.
   double pose_graph_odom_rot_sigma_deg = 1.0;
   double pose_graph_odom_trans_sigma_m = 0.02;
@@ -192,6 +205,9 @@ class OnlineLoopCloser {
   const OnlineLoopCorrection& LastCorrection() const {
     return last_correction_;
   }
+  // Frames that loop edges and confirmed loops refer to. Keyframe culling
+  // must keep them, or the pose graph loses its historical constraints.
+  void CollectProtectedImageIds(std::unordered_set<image_t>* ids) const;
 
   // Global relocalization for a resumed map: MixVPR retrieval over every stored
   // descriptor, then PnP of `image_id` against the retrieved map frames. The
@@ -210,6 +226,13 @@ class OnlineLoopCloser {
   // moved poses and points, and merge pairs now within the fuse distance.
   void FuseAfterLoopBA(Reconstruction& reconstruction,
                        ObservationManager* obs_manager);
+
+  // tgt_from_src VIO motion between two keyframes, nullopt if unknown.
+  using VioRelativePoseFn =
+      std::function<std::optional<Rigid3d>(image_t tgt_id, image_t src_id)>;
+  void SetVioRelativePose(VioRelativePoseFn fn) {
+    vio_relative_pose_ = std::move(fn);
+  }
 
  private:
   bool InitMixVprModel();
@@ -307,6 +330,7 @@ class OnlineLoopCloser {
   std::vector<LoopConstraint> loop_constraints_;
   OnlineLoopCorrection last_correction_;
   image_t last_loop_image_id_ = kInvalidImageId;
+  VioRelativePoseFn vio_relative_pose_;
 };
 
 }  // namespace colmap

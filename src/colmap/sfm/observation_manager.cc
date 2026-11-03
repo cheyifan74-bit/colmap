@@ -67,6 +67,8 @@ ObservationManager::ObservationManager(
          correspondence_graph_->NumMatchesBetweenAllImages()) {
       ImagePairStat image_pair_stat;
       image_pair_stat.num_total_corrs = num_matches;
+      // Counted below from the registered images.
+      image_pair_stat.visibility_counted = true;
       image_pair_stats_.emplace(pair_id, image_pair_stat);
     }
   }
@@ -200,6 +202,31 @@ void ObservationManager::AddImagePair(const image_t image_id1,
   stats2.num_correspondences =
       correspondence_graph_->NumCorrespondencesForImage(image_id2);
 
+  const bool count_visibility = !pair_stats.visibility_counted;
+  if (!seed_point3D_counts && !count_visibility) {
+    return;
+  }
+
+  FeatureMatches matches;
+  correspondence_graph_->ExtractMatchesBetweenImages(
+      image_id1, image_id2, matches);
+  const Image& image1 = reconstruction_.Image(image_id1);
+  const Image& image2 = reconstruction_.Image(image_id2);
+
+  // A pair that enters the graph after one of its images was registered
+  // missed that RegisterFrame increment, and DeRegisterFrame would later
+  // underflow the partner's num_visible_correspondences.
+  if (count_visibility) {
+    pair_stats.visibility_counted = true;
+    const point2D_t num_corrs = static_cast<point2D_t>(matches.size());
+    if (image1.HasPose()) {
+      stats2.num_visible_correspondences += num_corrs;
+    }
+    if (image2.HasPose()) {
+      stats1.num_visible_correspondences += num_corrs;
+    }
+  }
+
   if (!seed_point3D_counts) {
     return;
   }
@@ -210,11 +237,6 @@ void ObservationManager::AddImagePair(const image_t image_id1,
   // new correspondence (ResetTriObservations) even though the matching
   // increment never happened: the point was triangulated before this pair
   // existed.
-  FeatureMatches matches;
-  correspondence_graph_->ExtractMatchesBetweenImages(
-      image_id1, image_id2, matches);
-  const Image& image1 = reconstruction_.Image(image_id1);
-  const Image& image2 = reconstruction_.Image(image_id2);
   for (const FeatureMatch& match : matches) {
     if (match.point2D_idx1 >= image1.NumPoints2D() ||
         match.point2D_idx2 >= image2.NumPoints2D()) {

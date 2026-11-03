@@ -289,6 +289,10 @@ class Database {
   // Delete inlier matches of an image pair.
   virtual void DeleteInlierMatches(image_t image_id1, image_t image_id2) = 0;
 
+  // Delete an image together with its keypoints, descriptors, MixVPR
+  // descriptor, pose prior, frame data and every pair it takes part in.
+  virtual void DeleteImageData(image_t image_id) = 0;
+
   // Clear all database tables
   virtual void ClearAllTables() = 0;
 

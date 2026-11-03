@@ -1773,6 +1773,46 @@ class SqliteDatabase : public Database {
     UpdateTwoViewGeometry(image_id1, image_id2, geom);
   }
 
+  void DeleteImageData(const image_t image_id) override {
+    // pair_id = kMaxNumImages * min(id1, id2) + max(id1, id2).
+    // keypoints, descriptors and mixvpr_descriptors cascade from images.
+    static const char* const kStatements[] = {
+        "DELETE FROM matches WHERE pair_id / ?2 = ?1 OR pair_id % ?2 = ?1;",
+        "DELETE FROM two_view_geometries WHERE pair_id / ?2 = ?1 OR "
+        "pair_id % ?2 = ?1;",
+        "DELETE FROM pose_priors WHERE corr_data_id = ?1 AND "
+        "corr_sensor_type = ?3;",
+        "DELETE FROM frame_data WHERE data_id = ?1 AND sensor_type = ?3;",
+        "DELETE FROM frames WHERE frame_id NOT IN "
+        "(SELECT frame_id FROM frame_data);",
+        "DELETE FROM images WHERE image_id = ?1;",
+    };
+    for (const char* sql : kStatements) {
+      sqlite3_stmt* stmt = nullptr;
+      SQLITE3_CALL(sqlite3_prepare_v2(database_, sql, -1, &stmt, nullptr));
+      const int num_params = sqlite3_bind_parameter_count(stmt);
+      if (num_params >= 1) {
+        SQLITE3_CALL(sqlite3_bind_int64(stmt, 1, image_id));
+      }
+      if (num_params >= 2) {
+        SQLITE3_CALL(sqlite3_bind_int64(
+            stmt, 2, static_cast<sqlite3_int64>(kMaxNumImages)));
+      }
+      if (num_params >= 3) {
+        SQLITE3_CALL(sqlite3_bind_int64(
+            stmt, 3, static_cast<sqlite3_int64>(SensorType::CAMERA)));
+      }
+      const int rc = sqlite3_step(stmt);
+      sqlite3_finalize(stmt);
+      if (rc != SQLITE_DONE) {
+        LogMessageFatalThrow<std::runtime_error>(__FILE__, __LINE__).stream()
+            << "SQLite error deleting image " << image_id << ": "
+            << sqlite3_errstr(rc);
+      }
+    }
+    database_entry_deleted_ = true;
+  }
+
   void ClearAllTables() override {
     ClearMatches();
     ClearTwoViewGeometries();

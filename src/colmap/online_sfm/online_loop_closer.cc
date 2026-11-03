@@ -98,6 +98,97 @@ struct LoopPnPCorr {
   Eigen::Vector2d xy_current = Eigen::Vector2d::Zero();
 };
 
+// Feature scale consistency (BAFS observation model s = f * S / range). The
+// point size S is the median over its observations in the loaded images; a
+// keypoint is consistent when its scale is within the ratio of the scale S
+// predicts at the queried pose. Range is used instead of optical-axis depth
+// because the fisheye feature scale follows range.
+class LoopScaleCheck {
+ public:
+  explicit LoopScaleCheck(const double max_ratio)
+      : max_log_(max_ratio > 1.0 ? std::log(max_ratio) : 0.0) {}
+
+  bool Enabled() const { return max_log_ > 0.0; }
+
+  void Load(const Database& database, const image_t image_id) {
+    if (!Enabled() || scales_.count(image_id) > 0 ||
+        !database.ExistsKeypoints(image_id)) {
+      return;
+    }
+    const FeatureKeypoints keypoints = database.ReadKeypoints(image_id);
+    std::vector<float>& scales = scales_[image_id];
+    scales.resize(keypoints.size());
+    for (size_t i = 0; i < keypoints.size(); ++i) {
+      scales[i] = keypoints[i].ComputeScale();
+    }
+  }
+
+  // True also when there is nothing to compare against.
+  bool Consistent(const Reconstruction& reconstruction,
+                  const image_t image_id,
+                  const point2D_t point2D_idx,
+                  const point3D_t point3D_id,
+                  const Rigid3d& cam_from_world,
+                  const Camera& camera) const {
+    if (!Enabled() || !reconstruction.ExistsPoint3D(point3D_id)) {
+      return true;
+    }
+    const auto it = scales_.find(image_id);
+    if (it == scales_.end() || point2D_idx >= it->second.size() ||
+        it->second[point2D_idx] <= 0.0f) {
+      return true;
+    }
+    const double size = PointSize(reconstruction, point3D_id, image_id);
+    const double range = (reconstruction.Point3D(point3D_id).xyz -
+                          cam_from_world.TgtOriginInSrc())
+                             .norm();
+    if (size <= 0.0 || range <= 0.0) {
+      return true;
+    }
+    const double predicted = size * camera.MeanFocalLength() / range;
+    return std::abs(std::log(it->second[point2D_idx] / predicted)) <= max_log_;
+  }
+
+ private:
+  double PointSize(const Reconstruction& reconstruction,
+                   const point3D_t point3D_id,
+                   const image_t query_id) const {
+    const auto cached = sizes_.find(point3D_id);
+    if (cached != sizes_.end()) {
+      return cached->second;
+    }
+    const Point3D& point3D = reconstruction.Point3D(point3D_id);
+    std::vector<double> sizes;
+    for (const TrackElement& el : point3D.track.Elements()) {
+      const auto it = scales_.find(el.image_id);
+      if (el.image_id == query_id || it == scales_.end() ||
+          el.point2D_idx >= it->second.size() ||
+          !reconstruction.ExistsImage(el.image_id)) {
+        continue;
+      }
+      const Image& image = reconstruction.Image(el.image_id);
+      if (!image.HasPose() || !image.HasCameraPtr()) {
+        continue;
+      }
+      sizes.push_back(it->second[el.point2D_idx] *
+                      (point3D.xyz - image.ProjectionCenter()).norm() /
+                      image.CameraPtr()->MeanFocalLength());
+    }
+    double size = 0.0;
+    if (!sizes.empty()) {
+      std::nth_element(
+          sizes.begin(), sizes.begin() + sizes.size() / 2, sizes.end());
+      size = sizes[sizes.size() / 2];
+    }
+    sizes_.emplace(point3D_id, size);
+    return size;
+  }
+
+  double max_log_ = 0.0;
+  std::unordered_map<image_t, std::vector<float>> scales_;
+  mutable std::unordered_map<point3D_t, double> sizes_;
+};
+
 std::optional<Eigen::Vector2d> ProjectCam(const Camera& camera,
                                           const Eigen::Vector3d& xyz_cam) {
   if (xyz_cam.z() <= std::numeric_limits<double>::epsilon()) {
@@ -263,6 +354,7 @@ size_t SearchLoopByProjection(
     const std::unordered_map<image_t, FeatureDescriptors>& loop_desc,
     const FeatureDescriptors& desc_current,
     const double radius_px,
+    const LoopScaleCheck& scale_check,
     std::unordered_set<point2D_t>* used_current,
     std::unordered_set<point3D_t>* used_points,
     std::vector<LoopPnPCorr>* corrs) {
@@ -295,7 +387,13 @@ size_t SearchLoopByProjection(
       point2D_t best_idx = kInvalidPoint2DIdx;
       for (point2D_t i = 0; i < current.NumPoints2D(); ++i) {
         if (used_current->count(i) > 0 ||
-            (current.Point2D(i).xy - *proj).squaredNorm() >= radius_sq) {
+            (current.Point2D(i).xy - *proj).squaredNorm() >= radius_sq ||
+            !scale_check.Consistent(reconstruction,
+                                    current.ImageId(),
+                                    i,
+                                    p_loop.point3D_id,
+                                    cam_from_world,
+                                    camera)) {
           continue;
         }
         const float l2 = DescriptorL2Sq(desc_it->second, j, desc_current, i);
@@ -982,6 +1080,11 @@ std::vector<std::pair<image_t, float>> OnlineLoopCloser::DetectLoop(
       return false;
     }
     const Image& other = reconstruction.Image(other_id);
+    if (options_.min_candidate_points > 0 &&
+        other.NumPoints3D() <
+            static_cast<size_t>(options_.min_candidate_points)) {
+      return false;
+    }
     if (max_distance_sq >= 0.0) {
       if ((other.ProjectionCenter() - current_center).squaredNorm() >
           max_distance_sq) {
@@ -1092,6 +1195,7 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
   TwoViewGeometry geometry;
   FeatureDescriptors desc_current;
   FeatureDescriptors desc_candidate;
+  LoopScaleCheck scale_check(options_.scale_check_max_ratio);
   try {
     DatabaseSession session(database_path_);
     if (session->ExistsMatches(candidate_id, image_id)) {
@@ -1119,6 +1223,8 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
     if (session->ExistsDescriptors(candidate_id)) {
       desc_candidate = session->ReadDescriptors(candidate_id);
     }
+    scale_check.Load(*session, image_id);
+    scale_check.Load(*session, candidate_id);
   } catch (const std::exception& e) {
     LOG(WARNING) << "OnlineLoopCloser: failed to read pair " << candidate_id
                  << "-" << image_id << ": " << e.what();
@@ -1164,6 +1270,7 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
         if (id != candidate_id && session->ExistsDescriptors(id)) {
           loop_desc.emplace(id, session->ReadDescriptors(id));
         }
+        scale_check.Load(*session, id);
       }
     } catch (const std::exception& e) {
       LOG(WARNING) << "OnlineLoopCloser: failed to read loop-map descriptors "
@@ -1261,12 +1368,31 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
                                                    loop_desc,
                                                    desc_current,
                                                    options_.guided_radius_px,
+                                                   scale_check,
                                                    &used_current,
                                                    &used_points,
                                                    &corrs);
   FillPoints();
+  // Reprojection inliers whose keypoint scale disagrees with the loop-side
+  // observations are dropped; returns how many.
+  const auto RemoveScaleOutliers = [&]() {
+    size_t num_removed = 0;
+    for (size_t i = 0; i < corrs.size(); ++i) {
+      if (inliers[i] && !scale_check.Consistent(reconstruction,
+                                                image_id,
+                                                corrs[i].idx_current,
+                                                corrs[i].point3D_id,
+                                                cam_from_world,
+                                                camera)) {
+        inliers[i] = 0;
+        ++num_removed;
+      }
+    }
+    return num_removed;
+  };
   inliers = ComputePnPInliers(
       corrs, reconstruction, cam_from_world, camera, options_.pnp_max_error);
+  size_t num_scale_rejected = RemoveScaleOutliers();
   if (CountInliers(inliers) >=
           static_cast<size_t>(options_.min_num_3d_inliers) &&
       RefineAbsolutePose(refine_options,
@@ -1277,6 +1403,7 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
                          &camera)) {
     inliers = ComputePnPInliers(
         corrs, reconstruction, cam_from_world, camera, options_.pnp_max_error);
+    num_scale_rejected = RemoveScaleOutliers();
   }
   const size_t num_pnp_inliers = CountInliers(inliers);
 
@@ -1303,6 +1430,7 @@ bool OnlineLoopCloser::VerifyCandidate(const image_t image_id,
             << " guided=" << num_guided
             << " ransac_inliers=" << num_ransac_inliers
             << " inliers=" << num_pnp_inliers
+            << " scale_rejected=" << num_scale_rejected
             << " loop_map=" << loop_ids.size()
             << " baseline_m=" << baseline_m
             << " correction_m=" << loop_pair->correction_m
@@ -1554,6 +1682,7 @@ struct ProjectionFuseStats {
   size_t num_attached = 0;
   size_t num_rejected_dist = 0;
   size_t num_rejected_desc = 0;
+  size_t num_rejected_scale = 0;
 };
 
 // Project loop-side points into `image_ids` and merge or attach descriptor
@@ -1573,12 +1702,14 @@ ProjectionFuseStats FuseLoopMapByProjection(
 
   std::unordered_map<image_t, FeatureDescriptors> descriptors;
   std::unordered_map<point3D_t, std::vector<TrackElement>> loop_refs;
+  LoopScaleCheck scale_check(options.scale_check_max_ratio);
   try {
     DatabaseSession session(database_path);
     const auto Load = [&](const image_t id) {
       if (descriptors.count(id) == 0 && session->ExistsDescriptors(id)) {
         descriptors.emplace(id, session->ReadDescriptors(id));
       }
+      scale_check.Load(*session, id);
     };
     for (const image_t id : image_ids) {
       Load(id);
@@ -1661,6 +1792,7 @@ ProjectionFuseStats FuseLoopMapByProjection(
       float best_l2 = kLoopDescMaxL2Sq;
       point2D_t best_idx = kInvalidPoint2DIdx;
       bool any_in_radius = false;
+      bool any_scale_ok = false;
       const int pgx = static_cast<int>(proj->x() / cell);
       const int pgy = static_cast<int>(proj->y() / cell);
       for (int gy = std::max(0, pgy - 1); gy <= std::min(grid_h - 1, pgy + 1);
@@ -1673,6 +1805,11 @@ ProjectionFuseStats FuseLoopMapByProjection(
               continue;
             }
             any_in_radius = true;
+            if (!scale_check.Consistent(
+                    reconstruction, id, i, loop_pid, cam_from_world, camera)) {
+              continue;
+            }
+            any_scale_ok = true;
             float l2 = std::numeric_limits<float>::infinity();
             for (const TrackElement& ref : refs) {
               const auto ref_desc_it = descriptors.find(ref.image_id);
@@ -1693,7 +1830,11 @@ ProjectionFuseStats FuseLoopMapByProjection(
         }
       }
       if (best_idx == kInvalidPoint2DIdx) {
-        stats.num_rejected_desc += any_in_radius ? 1 : 0;
+        if (any_scale_ok) {
+          ++stats.num_rejected_desc;
+        } else if (any_in_radius) {
+          ++stats.num_rejected_scale;
+        }
         continue;
       }
       const Point2D& point2D = image.Point2D(best_idx);
@@ -1786,10 +1927,19 @@ bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
   };
 
   std::vector<PoseGraphEdge> edges;
+  size_t num_vio_odom_edges = 0;
   image_t prev_id = boundary_id;
   for (const image_t id : variable_ids) {
     if (prev_id != kInvalidImageId) {
-      edges.push_back(MakeOdometryEdge(prev_id, id, Rel(prev_id, id), 1.0));
+      std::optional<Rigid3d> vio_rel;
+      if (options_.pose_graph_vio_odometry && vio_relative_pose_) {
+        vio_rel = vio_relative_pose_(id, prev_id);
+      }
+      if (vio_rel) {
+        ++num_vio_odom_edges;
+      }
+      edges.push_back(MakeOdometryEdge(
+          prev_id, id, vio_rel ? *vio_rel : Rel(prev_id, id), 1.0));
     }
     prev_id = id;
   }
@@ -2100,7 +2250,9 @@ bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
             << " variable=[" << variable_ids.front() << ".."
             << variable_ids.back() << "](" << variable_ids.size() << ")"
             << " boundary=" << boundary_id << " anchor_max=" << anchor_max
-            << " edges=" << pg.num_edges << " covis_edges=" << num_covis_edges
+            << " edges=" << pg.num_edges
+            << " vio_odom_edges=" << num_vio_odom_edges
+            << " covis_edges=" << num_covis_edges
             << " old_covis_edges=" << num_old_covis_edges
             << " hist_loop_edges=" << num_hist_loop_edges
             << " dropped_loop_edges=" << num_dropped_loop_edges
@@ -2121,6 +2273,7 @@ bool OnlineLoopCloser::CorrectLoop(Reconstruction& reconstruction,
             << " attach_proj=" << num_attached_proj
             << " fuse_rejected_dist=" << num_rejected_dist
             << " fuse_rejected_desc=" << num_rejected_desc
+            << " fuse_rejected_scale=" << proj.num_rejected_scale
             << " window=" << connected.size() << " ["
             << *std::min_element(connected.begin(), connected.end()) << ".."
             << *std::max_element(connected.begin(), connected.end()) << "]";
@@ -2170,7 +2323,8 @@ void OnlineLoopCloser::FuseAfterLoopBA(Reconstruction& reconstruction,
             << " fuse_proj=" << proj.num_fused
             << " attach_proj=" << proj.num_attached
             << " fuse_rejected_dist=" << proj.num_rejected_dist
-            << " fuse_rejected_desc=" << proj.num_rejected_desc;
+            << " fuse_rejected_desc=" << proj.num_rejected_desc
+            << " fuse_rejected_scale=" << proj.num_rejected_scale;
 }
 
 PoseGraphOptions OnlineLoopCloser::MakePoseGraphOptions() const {
@@ -2333,6 +2487,22 @@ size_t OnlineLoopCloser::AppendLoopEdges(
     edge_constraints->push_back(edge);
   }
   return num_hist;
+}
+
+void OnlineLoopCloser::CollectProtectedImageIds(
+    std::unordered_set<image_t>* ids) const {
+  for (const LoopConstraint& constraint : loop_constraints_) {
+    ids->insert(constraint.map_id);
+    ids->insert(constraint.query_id);
+  }
+  for (const OnlineLoopPair& pair : confirmed_loops_) {
+    ids->insert(pair.image_id1);
+    ids->insert(pair.image_id2);
+  }
+  if (last_correction_.current_id != kInvalidImageId) {
+    ids->insert(last_correction_.current_id);
+    ids->insert(last_correction_.loop_id);
+  }
 }
 
 void OnlineLoopCloser::ForgetLoopConstraint(const image_t map_id,
