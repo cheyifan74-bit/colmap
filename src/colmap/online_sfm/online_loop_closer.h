@@ -39,7 +39,9 @@
 #include "colmap/util/eigen_alignment.h"
 #include "colmap/util/types.h"
 
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -70,6 +72,9 @@ struct OnlineLoopCloserOptions {
   double min_mixvpr_score = 0.4;
   int topk = 5;
   int min_covisibility_points = 15;
+  // Candidates with fewer 3D points are weakly constrained themselves and
+  // become the fixed node of the correction. 0 disables.
+  int min_candidate_points = 0;
   int min_num_matches = 20;
   // PnP inliers after guided projection matching.
   int min_num_verified_matches = 40;
@@ -84,6 +89,17 @@ struct OnlineLoopCloserOptions {
   double pnp_max_error = 3.0;
   // Guided projection search radius when growing PnP matches (pixels).
   double guided_radius_px = 7.5;
+  // Feature scale consistency of the PnP pose: a 2D-3D pair whose keypoint
+  // scale differs from the scale predicted by the loop-side observations
+  // (s = f * S / range) by more than this factor is not an inlier, and guided
+  // matching skips such keypoints. <= 1 disables.
+  double scale_check_max_ratio = 0.0;
+  // When the candidate alone gives too few 2D-3D pairs, descriptor-match the
+  // current frame against the 3D points of the candidate's covisibility
+  // island, keeping matches near the candidate-current epipolar plane.
+  bool island_2d3d = true;
+  // Epipolar gate of the island matches (pixels at the mean focal length).
+  double island_epipolar_px = 4.0;
   // Loop rotation (PnP) vs essential-matrix rotation; <=0 disables.
   double max_rot_vs_essential_deg = 3.0;
   // Reject loops whose correction of the current pose is larger than this.
@@ -91,9 +107,42 @@ struct OnlineLoopCloserOptions {
   double max_correction_deg = 20.0;
   // Covisibility edges in the pose graph need at least this many shared points.
   int pose_graph_min_covis = 50;
+  // x, y, z + yaw per node (roll / pitch observable from the IMU). The map
+  // world frame must be the gravity-aligned VIO frame (+z up).
+  bool pose_graph_4dof = true;
+  // Odometry edges take the VIO relative pose where both frames have one,
+  // instead of the current map poses (which may already be distorted).
+  bool pose_graph_vio_odometry = false;
+  // Odometry / covisibility edge 1-sigma; translation grows with step length.
+  double pose_graph_odom_rot_sigma_deg = 1.0;
+  double pose_graph_odom_trans_sigma_m = 0.02;
+  double pose_graph_odom_trans_sigma_ratio = 0.03;
+  // Lower bounds on the loop edge 1-sigma taken from the PnP covariance, which
+  // ignores 3D point error.
+  double pose_graph_loop_min_rot_sigma_deg = 0.2;
+  double pose_graph_loop_min_trans_sigma_m = 0.02;
+  // Trajectory prior check (ROVER, arXiv 2508.13488): align the camera
+  // centers of the frames between loop and current frame before / after the
+  // pose graph (yaw + translation, or SE3 in 6-DoF mode) and reject the loop
+  // when the remaining RMSE exceeds
+  // max(rover_min_threshold_m, rover_threshold_ratio * path length).
+  // A true loop bends the trajectory smoothly; a false one tears it apart.
+  bool rover_enabled = true;
+  double rover_min_threshold_m = 0.5;
+  double rover_threshold_ratio = 0.01;
   // Projection fusion after correction.
   double fuse_radius_px = 6.0;
   double fuse_max_point_distance = 0.2;
+
+  // Relocalization against a map resumed from disk. The current frame has no
+  // pose yet, so retrieval runs over the whole stored map and the thresholds
+  // are stricter than loop closure: a wrong fix biases every following frame.
+  int reloc_topk = 5;
+  double reloc_min_mixvpr_score = 0.5;
+  int reloc_min_num_matches = 30;
+  int reloc_min_num_3d_correspondences = 40;
+  int reloc_min_inliers = 80;
+  double reloc_max_rot_vs_essential_deg = 3.0;
 };
 
 struct OnlineLoopPair {
@@ -110,6 +159,9 @@ struct OnlineLoopPair {
   double correction_m = 0.0;
   double correction_deg = 0.0;
   double rot_vs_essential_deg = -1.0;
+  // Loop edge 1-sigma (radians / meters) from the PnP covariance.
+  double rot_sigma = 0.0;
+  double trans_sigma = 0.0;
   // PnP inliers: (current point2D idx, loop-side point3D id).
   std::vector<std::pair<point2D_t, point3D_t>> loop_observations;
 };
@@ -153,11 +205,34 @@ class OnlineLoopCloser {
   const OnlineLoopCorrection& LastCorrection() const {
     return last_correction_;
   }
+  // Frames that loop edges and confirmed loops refer to. Keyframe culling
+  // must keep them, or the pose graph loses its historical constraints.
+  void CollectProtectedImageIds(std::unordered_set<image_t>* ids) const;
+
+  // Global relocalization for a resumed map: MixVPR retrieval over every stored
+  // descriptor, then PnP of `image_id` against the retrieved map frames. The
+  // current frame must exist in `reconstruction` with keypoints but no pose.
+  // On success `loop_pair` holds the map pose (`loop_cam_from_world`) and the
+  // inlier 2D-3D correspondences.
+  bool Relocalize(image_t image_id,
+                  const DatabaseCache& cache,
+                  const Reconstruction& reconstruction,
+                  OnlineFeatureMatcher* matcher,
+                  const std::string& image_abs_path,
+                  const Bitmap* bitmap,
+                  OnlineLoopPair* loop_pair);
 
   // Project the loop-side map into the fusion window again, after loop BA has
   // moved poses and points, and merge pairs now within the fuse distance.
   void FuseAfterLoopBA(Reconstruction& reconstruction,
                        ObservationManager* obs_manager);
+
+  // tgt_from_src VIO motion between two keyframes, nullopt if unknown.
+  using VioRelativePoseFn =
+      std::function<std::optional<Rigid3d>(image_t tgt_id, image_t src_id)>;
+  void SetVioRelativePose(VioRelativePoseFn fn) {
+    vio_relative_pose_ = std::move(fn);
+  }
 
  private:
   bool InitMixVprModel();
@@ -168,10 +243,28 @@ class OnlineLoopCloser {
       const Reconstruction& reconstruction);
   // Matches for every candidate are already written. Reads that pair and runs
   // PnP only when the match count is high enough.
+  // Acceptance thresholds differ between loop closure and relocalization.
+  struct CandidateGate {
+    size_t min_matches = 0;
+    size_t min_3d_corrs = 0;
+    size_t min_inliers = 0;
+    double max_rot_vs_essential_deg = -1.0;
+    // Relocalization runs before the frame has a pose.
+    bool require_current_pose = true;
+    // Loop closure rejects corrections larger than the configured gate.
+    bool check_correction = true;
+  };
+  CandidateGate LoopGate() const;
+  CandidateGate RelocGate() const;
+  bool EncodeQuery(image_t image_id,
+                   const std::string& image_abs_path,
+                   const Bitmap* bitmap,
+                   Eigen::VectorXf* query);
   bool VerifyCandidate(image_t image_id,
                        image_t candidate_id,
                        float retrieval_score,
                        const Reconstruction& reconstruction,
+                       const CandidateGate& gate,
                        OnlineLoopPair* loop_pair);
   bool CorrectLoop(Reconstruction& reconstruction,
                    ObservationManager* obs_manager,
@@ -194,9 +287,16 @@ class OnlineLoopCloser {
     image_t query_id = kInvalidImageId;
     Rigid3d query_from_map;
     size_t num_inliers = 0;
+    double rot_sigma = 0.0;
+    double trans_sigma = 0.0;
   };
 
-  double LoopConstraintWeight(size_t num_inliers, size_t ref_inliers) const;
+  PoseGraphOptions MakePoseGraphOptions() const;
+  // Odometry / covisibility edge from the pre-correction relative pose.
+  PoseGraphEdge MakeOdometryEdge(image_t i,
+                                 image_t j,
+                                 const Rigid3d& j_from_i,
+                                 double sigma_scale) const;
   // Queries within the cooldown and map frames in one covisibility group are
   // the same place. The pose graph keeps a single edge per cluster.
   bool SameLoopCluster(image_t query_a,
@@ -207,15 +307,17 @@ class OnlineLoopCloser {
   bool HistoricalResidualPlausible(const Rigid3d& measured,
                                    const Rigid3d& current_rel) const;
   // Adds `current` plus historical constraints whose query frame is still in
-  // `variable_set`. Returns how many historical edges were added.
+  // `variable_set`. Appends the loop edges' constraints to `edge_constraints`
+  // in edge order. Returns how many historical edges were added.
   size_t AppendLoopEdges(const Reconstruction& reconstruction,
                          const std::unordered_set<image_t>& variable_set,
                          const LoopConstraint& current,
-                         const PoseGraphOptions& graph_options,
                          std::unordered_map<image_t, Rigid3d>* poses_old,
                          std::unordered_set<image_t>* fixed_ids,
-                         std::vector<PoseGraphEdge>* edges);
+                         std::vector<PoseGraphEdge>* edges,
+                         std::vector<LoopConstraint>* edge_constraints);
   void RememberLoopConstraint(const LoopConstraint& constraint);
+  void ForgetLoopConstraint(image_t map_id, image_t query_id);
 
   std::string database_path_;
   OnlineLoopCloserOptions options_;
@@ -228,6 +330,7 @@ class OnlineLoopCloser {
   std::vector<LoopConstraint> loop_constraints_;
   OnlineLoopCorrection last_correction_;
   image_t last_loop_image_id_ = kInvalidImageId;
+  VioRelativePoseFn vio_relative_pose_;
 };
 
 }  // namespace colmap

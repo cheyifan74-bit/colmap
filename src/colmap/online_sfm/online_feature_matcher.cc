@@ -321,6 +321,20 @@ void OnlineFeatureMatcher::PutPosePrior(const image_t image_id,
   pose_priors_[image_id] = cam_from_world;
 }
 
+void OnlineFeatureMatcher::ForgetImage(const image_t image_id) {
+  forgotten_ids_.insert(image_id);
+  pose_priors_.erase(image_id);
+  if (feature_cache_.erase(image_id) > 0) {
+    feature_cache_order_.erase(std::remove(feature_cache_order_.begin(),
+                                           feature_cache_order_.end(),
+                                           image_id),
+                               feature_cache_order_.end());
+    if (cpu_match_ && cpu_match_->index_cache) {
+      cpu_match_->index_cache->Evict(image_id);
+    }
+  }
+}
+
 bool OnlineFeatureMatcher::SpatialEnabled() const {
   return options_.spatial_max_distance > 0.0 &&
          options_.spatial_max_angle_deg > 0.0;
@@ -358,7 +372,7 @@ std::vector<image_t> OnlineFeatureMatcher::SelectTemporalOverlapImages(
   previous_ids.reserve(cache.NumImages());
   for (const auto& [id, image] : cache.Images()) {
     (void)image;
-    if (id < image_id) {
+    if (id < image_id && forgotten_ids_.count(id) == 0) {
       previous_ids.push_back(id);
     }
   }

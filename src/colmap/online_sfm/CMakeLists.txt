@@ -51,3 +51,4 @@ COLMAP_ADD_LIBRARY(
     PRIVATE_LINK_LIBS
         colmap_sensor
 )
+

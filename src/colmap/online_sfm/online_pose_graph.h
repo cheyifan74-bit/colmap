@@ -11,22 +11,25 @@ namespace colmap {
 
 // Relative-pose edge: cam_j_from_cam_i measured before loop correction
 // (odometry / covisibility) or from the loop PnP pose (loop edge).
+// Residual = [rotation error / rot_sigma, (p_j_in_i - p_meas) / trans_sigma],
+// p_j_in_i = camera j center in camera i. In 4-DoF mode the rotation error is
+// the yaw about world +z only.
 struct PoseGraphEdge {
   image_t image_id_i = kInvalidImageId;
   image_t image_id_j = kInvalidImageId;
   Rigid3d j_from_i;
-  double weight = 1.0;
-  // Huber knee on the residual L2 norm. <=0 keeps a squared residual.
-  // Loop edges set this in weighted-residual units so a bad historical
-  // measurement cannot dominate the odometry chain.
-  double robust_loss_scale = 0.0;
+  // Isotropic 1-sigma, radians / meters.
+  double rot_sigma = 1.0;
+  double trans_sigma = 1.0;
+  // Huber at the 95% chi-square quantile of the whitened residual.
+  bool robust = false;
 };
 
 struct PoseGraphOptions {
   int max_num_iterations = 50;
-  // Residual = [w_rot * 2 * vec(dq), w_trans * dt]; 1 rad ~ w_rot / w_trans m.
-  double rotation_weight = 1.0;
-  double translation_weight = 1.0;
+  // Optimize camera center + yaw about world +z per node; roll / pitch stay at
+  // their input values. Requires a gravity-aligned (VIO) world frame.
+  bool four_dof = false;
 };
 
 struct PoseGraphSummary {
@@ -36,11 +39,18 @@ struct PoseGraphSummary {
   int num_edges = 0;
   double initial_cost = 0.0;
   double final_cost = 0.0;
+  // Whitened squared residual per input edge after the solve (-1 if the edge
+  // was not added). Robust edges are reported without the loss.
+  std::vector<double> edge_chi2;
 };
 
-// SE3 pose graph over cam_from_world poses. Nodes in `fixed_ids` stay
-// constant; every other node referenced by an edge is optimized in place.
-PoseGraphSummary OptimizeSE3PoseGraph(
+// Chi-square quantile of one edge residual (dof 6, or 4 in 4-DoF mode).
+double PoseGraphEdgeChi2Quantile(const PoseGraphOptions& options,
+                                 double probability);
+
+// Pose graph over cam_from_world poses. Nodes in `fixed_ids` stay constant;
+// every other node referenced by an edge is optimized in place.
+PoseGraphSummary OptimizePoseGraph(
     const PoseGraphOptions& options,
     const std::vector<PoseGraphEdge>& edges,
     const std::unordered_set<image_t>& fixed_ids,

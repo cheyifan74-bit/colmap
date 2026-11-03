@@ -415,6 +415,10 @@ class PyDatabaseImpl : public Database, py::trampoline_self_life_support {
         void, Database, DeleteInlierMatches, image_id1, image_id2);
   }
 
+  void DeleteImageData(image_t image_id) override {
+    PYBIND11_OVERRIDE_PURE(void, Database, DeleteImageData, image_id);
+  }
+
   void ClearAllTables() override {
     PYBIND11_OVERRIDE_PURE(void, Database, ClearAllTables);
   }
