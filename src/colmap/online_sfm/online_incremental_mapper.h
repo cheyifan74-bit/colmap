@@ -46,6 +46,36 @@
 
 namespace colmap {
 
+// Outcome of one Process() call for the dense mapper. Poses are cam_from_world
+// of the fisheye left camera, quaternion xyzw then translation.
+struct MappingPose {
+  double q_xyzw[4] = {0, 0, 0, 1};
+  double t[3] = {0, 0, 0};
+};
+
+struct MappingFrameResult {
+  bool registered = false;
+  MappingPose cam_from_world;
+  std::vector<image_t> removed_ids;
+  // Keyframes whose pose changed in this call (loop correction), with the pose
+  // after the correction.
+  std::vector<std::pair<image_t, MappingPose>> dirty_poses;
+};
+
+inline MappingPose PoseFromRigid3d(const Rigid3d& cam_from_world) {
+  MappingPose pose;
+  const Eigen::Quaterniond q = cam_from_world.rotation();
+  pose.q_xyzw[0] = q.x();
+  pose.q_xyzw[1] = q.y();
+  pose.q_xyzw[2] = q.z();
+  pose.q_xyzw[3] = q.w();
+  const Eigen::Vector3d t = cam_from_world.translation();
+  pose.t[0] = t.x();
+  pose.t[1] = t.y();
+  pose.t[2] = t.z();
+  return pose;
+}
+
 // Online wrapper around incremental SfM. Each Process() call:
 //   incrementally update DatabaseCache / correspondence graph
 //   extract -> WriteKeypoints / WriteDescriptors
@@ -73,7 +103,8 @@ class OnlineIncrementalMapper {
 
   bool Process(image_t image_id, const std::string& image_abs_path,
                const std::optional<Rigid3d>& cam_from_world_prior =
-                   std::nullopt);
+                   std::nullopt,
+               MappingFrameResult* mapping_result = nullptr);
 
   // Load the map written by a previous session (sparse model + the matching
   // part of the database) and switch to relocalization mode. Mapping resumes
@@ -122,6 +153,10 @@ class OnlineIncrementalMapper {
   bool IngestTwoViewGeometries(image_t image_id);
   // One relocalization attempt in `kLocalizing`. Returns true when the frame
   // was handled (registered or deliberately skipped).
+  void WriteMappingResult(image_t image_id,
+                          const std::vector<image_t>& removed_ids,
+                          const std::vector<image_t>& dirty_ids,
+                          MappingFrameResult* mapping_result) const;
   bool LocalizeCurrent(image_t image_id,
                        const std::string& image_abs_path,
                        const std::optional<Rigid3d>& cam_from_world_prior,

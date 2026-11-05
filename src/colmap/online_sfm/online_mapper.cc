@@ -1010,6 +1010,34 @@ size_t OnlineMapper::TriangulateImage(const image_t image_id) {
   return num_tris;
 }
 
+size_t OnlineMapper::FilterPointsInImages(
+    const FlatHashSet<image_t>& image_ids) {
+  if (!obs_manager_) {
+    return 0;
+  }
+  size_t num_filtered = obs_manager_->FilterPoints3DInImages(
+      options_.filter_max_reproj_error,
+      options_.filter_min_tri_angle,
+      image_ids);
+  if (options_.filter_two_view_min_tri_angle <= 0.0) {
+    return num_filtered;
+  }
+  FlatHashSet<point3D_t> point_ids;
+  for (const image_t image_id : image_ids) {
+    if (!reconstruction_->ExistsImage(image_id)) {
+      continue;
+    }
+    for (const Point2D& point2D : reconstruction_->Image(image_id).Points2D()) {
+      if (point2D.HasPoint3D()) {
+        point_ids.insert(point2D.point3D_id);
+      }
+    }
+  }
+  num_filtered += obs_manager_->FilterTwoViewPointsWithSmallTriangulationAngle(
+      options_.filter_two_view_min_tri_angle, point_ids);
+  return num_filtered;
+}
+
 void OnlineMapper::MergeAndFilterPoints(const image_t image_id) {
   if (!triangulator_ || !obs_manager_ ||
       !reconstruction_->ExistsImage(image_id)) {
@@ -1036,10 +1064,7 @@ void OnlineMapper::MergeAndFilterPoints(const image_t image_id) {
 
   FlatHashSet<image_t> filter_ids;
   filter_ids.insert(image_id);
-  const size_t num_filtered = obs_manager_->FilterPoints3DInImages(
-      options_.filter_max_reproj_error,
-      options_.filter_min_tri_angle,
-      filter_ids);
+  const size_t num_filtered = FilterPointsInImages(filter_ids);
   triangulator_->ClearModifiedPoints3D();
 
   LOG(INFO) << "OnlineMapper: merge/filter image " << image_id
@@ -1452,9 +1477,7 @@ void OnlineMapper::AdjustLocalBundle(const image_t image_id) {
   triangulator_->CompleteTracks(options_.triangulation, variable_point3D_ids);
   triangulator_->CompleteImage(options_.triangulation, image_id);
   FlatHashSet<image_t> filter_ids(variable_ids.begin(), variable_ids.end());
-  obs_manager_->FilterPoints3DInImages(options_.filter_max_reproj_error,
-                                       options_.filter_min_tri_angle,
-                                       filter_ids);
+  FilterPointsInImages(filter_ids);
 }
 
 void OnlineMapper::AdjustLoopBundle(const std::vector<image_t>& variable_ids,
@@ -1559,9 +1582,7 @@ void OnlineMapper::AdjustLoopBundle(const std::vector<image_t>& variable_ids,
   triangulator_->MergeTracks(options_.triangulation, variable_point3D_ids);
   triangulator_->CompleteTracks(options_.triangulation, variable_point3D_ids);
   FlatHashSet<image_t> filter_ids(used_variable.begin(), used_variable.end());
-  obs_manager_->FilterPoints3DInImages(options_.filter_max_reproj_error,
-                                       options_.filter_min_tri_angle,
-                                       filter_ids);
+  FilterPointsInImages(filter_ids);
 }
 
 image_t OnlineMapper::KeyframeGap(const image_t id_i, const image_t id_j) const {

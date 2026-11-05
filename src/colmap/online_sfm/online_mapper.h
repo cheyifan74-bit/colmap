@@ -64,6 +64,9 @@ struct OnlineMapperOptions {
   int ba_min_covisibility_points = 15;
   double filter_max_reproj_error = 1.0;
   double filter_min_tri_angle = 1.5;
+  // After reprojection filtering, drop tracks that shrank to two views when
+  // their only triangulation angle is below this. <= 0 disables.
+  double filter_two_view_min_tri_angle = 8.0;
   // Local-map projection matching: points seen by the last N registered
   // frames are projected into the current frame and matched by descriptor.
   // Before registration the VIO-predicted pose is used with
@@ -317,6 +320,9 @@ class OnlineMapper {
   bool TryInitialize(image_t image_id);
   void UnregisterFrame(image_t image_id);
   size_t TriangulateImage(image_t image_id);
+  // Reprojection and min-angle filter, then drop two-view tracks whose only
+  // triangulation angle is below filter_two_view_min_tri_angle.
+  size_t FilterPointsInImages(const FlatHashSet<image_t>& image_ids);
   void MergeAndFilterPoints(image_t image_id);
   void AdjustLocalBundle(image_t image_id);
   bool CollectRegisteredImage(image_t image_id,

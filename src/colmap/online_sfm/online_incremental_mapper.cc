@@ -472,9 +472,35 @@ void OnlineIncrementalMapper::FlushSparse() {
   mapper_->WriteSparse();
 }
 
+void OnlineIncrementalMapper::WriteMappingResult(
+    const image_t image_id, const std::vector<image_t>& removed_ids,
+    const std::vector<image_t>& dirty_ids,
+    MappingFrameResult* mapping_result) const {
+  if (mapping_result == nullptr || !mapper_) {
+    return;
+  }
+  *mapping_result = {};
+  mapping_result->removed_ids = removed_ids;
+  const Reconstruction& reconstruction = mapper_->GetReconstruction();
+  for (const image_t id : dirty_ids) {
+    if (!reconstruction.ExistsImage(id) || !reconstruction.Image(id).HasPose()) {
+      continue;
+    }
+    mapping_result->dirty_poses.emplace_back(
+        id, PoseFromRigid3d(reconstruction.Image(id).CamFromWorld()));
+  }
+  if (reconstruction.ExistsImage(image_id) &&
+      reconstruction.Image(image_id).HasPose()) {
+    mapping_result->registered = true;
+    mapping_result->cam_from_world =
+        PoseFromRigid3d(reconstruction.Image(image_id).CamFromWorld());
+  }
+}
+
 bool OnlineIncrementalMapper::Process(
     const image_t image_id, const std::string& image_abs_path,
-    const std::optional<Rigid3d>& cam_from_world_prior) {
+    const std::optional<Rigid3d>& cam_from_world_prior,
+    MappingFrameResult* mapping_result) {
   if (database_path_.empty()) {
     LOG(ERROR) << "OnlineIncrementalMapper: empty database path";
     return false;
@@ -520,22 +546,28 @@ bool OnlineIncrementalMapper::Process(
   }
 
   if (mode_ == SessionMode::kLocalizing) {
-    return LocalizeCurrent(
+    const bool handled = LocalizeCurrent(
         image_id,
         image_abs_path,
         cam_from_world_prior,
         extracted.bitmap.IsEmpty() ? nullptr : &extracted.bitmap);
+    WriteMappingResult(image_id, {}, {}, mapping_result);
+    return handled;
   }
 
   if (!mapper_->MappingCurrentImage(image_id, cam_from_world_prior)) {
+    WriteMappingResult(image_id, {}, {}, mapping_result);
     return false;
   }
   if (mapper_->LastFrameSkipped()) {
     matcher_->ForgetImage(image_id);
+    WriteMappingResult(image_id, {image_id}, {}, mapping_result);
     return true;
   }
 
   bool corrected = false;
+  std::vector<image_t> removed_ids;
+  std::vector<image_t> dirty_ids;
   if (loop_closer_ && loop_closer_->IsLoopClosureActive()) {
     corrected = loop_closer_->Process(
         image_id,
@@ -551,6 +583,7 @@ bool OnlineIncrementalMapper::Process(
       loop_closer_->FuseAfterLoopBA(mapper_->GetReconstruction(),
                                     mapper_->GetObservationManager());
       mapper_->WriteSparse();
+      dirty_ids = correction.variable_ids;
     }
   }
 
@@ -563,13 +596,16 @@ bool OnlineIncrementalMapper::Process(
     for (const image_t culled_id :
          mapper_->CullRedundantKeyframes(image_id, protected_ids)) {
       matcher_->ForgetImage(culled_id);
+      removed_ids.push_back(culled_id);
     }
     for (const image_t evicted_id :
          mapper_->EnforceSpatialCapacity(image_id, protected_ids)) {
       matcher_->ForgetImage(evicted_id);
+      removed_ids.push_back(evicted_id);
     }
   }
 
+  WriteMappingResult(image_id, removed_ids, dirty_ids, mapping_result);
   return true;
 }
 
