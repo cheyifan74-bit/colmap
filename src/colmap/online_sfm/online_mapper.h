@@ -108,22 +108,25 @@ struct OnlineMapperOptions {
   // Write the full sparse model every N successful map updates.
   // <=1 writes every frame. Init, loop correction, and shutdown always flush.
   int sparse_write_every_n = 10;
-  // Redundant keyframe culling over the covisible frames of the newest
-  // keyframe. A frame is removed when at least `cull_redundant_ratio` of its
-  // 3D points are observed by `cull_min_other_observers` other keyframes from
-  // no farther than `cull_max_scale_ratio` x its own viewing distance.
+  // Redundant keyframe culling. A frame is a candidate when at least
+  // `cull_redundant_ratio` of its 3D points are observed by
+  // `cull_min_other_observers` other keyframes from no farther than
+  // `cull_max_scale_ratio` x its own viewing distance. The candidate with the
+  // fewest unique close observations is removed.
   bool cull_enabled = false;
   double cull_redundant_ratio = 0.9;
   int cull_min_other_observers = 3;
   double cull_max_scale_ratio = 1.2;
   // Frames with fewer 3D points carry the VIO chain through weak texture.
   int cull_min_num_points = 30;
-  // The newest N registered keyframes are never culled.
+  // Among the newest N registered keyframes, only a frame whose share of
+  // length-2 tracks is at least `cull_protect_short_track_ratio` is kept.
   int cull_protect_recent = 5;
-  // The VIO-prior neighbours left around a culled frame must stay this close.
-  double cull_max_neighbor_distance_m = 3.0;
-  double cull_max_neighbor_angle_deg = 45.0;
-  int cull_max_per_frame = 1;
+  double cull_protect_short_track_ratio = 0.1;
+  // Drop the candidate when removing it would leave more than this share of
+  // its points below the triangulation-angle limits.
+  double cull_max_parallax_fail_ratio = 0.1;
+  int cull_max_per_frame = 3;
   // Frames restored from a previous session have no VIO prior in this one.
   bool cull_prior_session = false;
 
@@ -136,6 +139,11 @@ struct OnlineMapperOptions {
   double insert_ref_tracked_ratio = 0.9;
   // Fewer tracked 3D points always inserts.
   int insert_min_tracked = 40;
+  // PnP frames at or above these shares are kept. The first is features not yet
+  // tied to a 3D point; the second is tracked points whose track still has only
+  // one other view. <= 0 disables that check.
+  double insert_min_unmatched_ratio = 0.35;
+  double insert_min_short_track_ratio = 0.2;
   // An existing keyframe this close must share at least half of the tracked
   // points, i.e. the frame is consistent with that part of the map.
   double insert_max_kf_distance_m = 1.0;
@@ -152,19 +160,40 @@ struct OnlineMapperOptions {
   double stale_max_found_ratio = 0.25;
   // Only points not observed by any keyframe of this session are judged.
   bool stale_prior_session_only = true;
+  // A point missed by this many checks in a row is removed regardless of its
+  // lifetime found ratio, so a changed scene is dropped quickly. <=0 disables.
+  int stale_max_consecutive_misses = 5;
+  // Points of keyframes within this distance and optical-axis angle are
+  // checked too, even when they share no point with the current frame.
+  double stale_spatial_max_distance_m = 3.0;
+  double stale_spatial_max_angle_deg = 60.0;
+  int stale_spatial_num_images = 15;
+  // A point projected in view with no keypoint near it this many times in a
+  // row (keypoint misses included) is removed. <=0 disables.
+  int stale_max_consecutive_unseen = 8;
+  // A keyframe that lost points to stale removal is dropped once fewer than
+  // `stale_frame_min_points` remain or this share of them is gone.
+  int stale_frame_min_points = 20;
+  double stale_frame_max_lost_ratio = 0.7;
   // Statistics loaded from the previous session are scaled by this, so recent
   // sessions dominate the found ratio.
   double stale_session_decay = 0.5;
 
-  // Spatial capacity: at most `capacity_max_per_cell` keyframes per voxel and
-  // viewing-yaw bin, scored by the sum of their points' found ratios. When a
-  // new keyframe overfills a cell it is the one dropped, unless the worst
-  // existing keyframe scores below `capacity_replace_ratio` x the new one.
+  // Spatial capacity: at most `capacity_max_per_cell` keyframes that share a
+  // voxel and look within `capacity_view_angle_deg` of each other. Pitch and
+  // yaw both come from the optical axis. A frame within `capacity_boundary_m`
+  // of a voxel face also competes with that direction in the neighboring
+  // voxel. Score is the share of points for which the frame is a closest
+  // observer. An old frame is replaced only when it scores below
+  // `capacity_replace_ratio` times the new one; otherwise the new frame goes.
   bool capacity_enabled = false;
   double capacity_voxel_m = 1.0;
+  // Unused. Optical-axis angle replaces the old yaw bins.
   int capacity_yaw_bins = 4;
+  double capacity_view_angle_deg = 25.0;
+  double capacity_boundary_m = 0.2;
   int capacity_max_per_cell = 2;
-  double capacity_replace_ratio = 0.5;
+  double capacity_replace_ratio = 0.8;
   // Keyframes of previous sessions are replaced only after this session has
   // mapped this many keyframes since initialization / relocalization.
   int capacity_min_session_frames = 20;
@@ -232,14 +261,27 @@ class OnlineMapper {
   void AdjustLoopBundle(const std::vector<image_t>& variable_ids,
                         const std::vector<image_t>& anchor_ids);
 
-  // Remove keyframes made redundant by `image_id` from its covisible window.
+  // Remove the covisible keyframe with the fewest unique close observations.
   // `protected_ids` (loop edges, anchors) are kept. Returns the culled ids.
   std::vector<image_t> CullRedundantKeyframes(
       image_t image_id, const std::unordered_set<image_t>& protected_ids);
-  // Evict the lowest scored keyframes of the cell `image_id` falls into while
-  // the cell holds more than `capacity_max_per_cell`. Returns the evicted ids.
+  // Same rule over `candidate_ids` only. Does not expand a covisible window
+  // around each candidate, so a loop can clean the corrected chain in one pass.
+  std::vector<image_t> CullRedundantKeyframes(
+      const std::vector<image_t>& candidate_ids,
+      const std::unordered_set<image_t>& protected_ids);
+  // Evict the lowest-scoring same-direction keyframes while the voxel holds
+  // more than `capacity_max_per_cell`. Returns the evicted ids.
   std::vector<image_t> EnforceSpatialCapacity(
       image_t image_id, const std::unordered_set<image_t>& protected_ids);
+  // Keyframes left with little geometry after stale point removal.
+  std::vector<image_t> RemoveStaleKeyframes(
+      image_t current_id, const std::unordered_set<image_t>& protected_ids);
+  // After loop correction, rebalance each voxel and viewing direction touched
+  // by `image_ids`. The registered map is indexed once.
+  std::vector<image_t> EnforceSpatialCapacity(
+      const std::vector<image_t>& image_ids,
+      const std::unordered_set<image_t>& protected_ids);
   // Deregister a keyframe and drop its mapper state. The database rows stay;
   // the next resume skips it because it is no longer in the sparse model.
   // `reason` / `score` go to culled_keyframes.txt for the database compaction.
@@ -302,7 +344,8 @@ class OnlineMapper {
       double radius_px,
       const FlatHashSet<point2D_t>& skip_points2D,
       const FlatHashSet<point3D_t>& candidate_points,
-      std::vector<point3D_t>* visible_points) const;
+      std::vector<point3D_t>* visible_points,
+      std::vector<point3D_t>* bare_points = nullptr) const;
   // After registration: attach local-map points to unassociated keypoints.
   size_t ExtendTracksByProjection(image_t image_id, const char* stage);
   // Frames whose pose block is missing from `problem` (no observations) are
@@ -345,11 +388,11 @@ class OnlineMapper {
   // Fraction of `image_id`'s 3D points seen by enough closer-or-equal other
   // keyframes; `num_points` receives its 3D point count.
   double RedundantPointRatio(image_t image_id, size_t* num_points) const;
-  // Nearest registered frames with a VIO prior before / after `image_id`.
-  std::pair<image_t, image_t> PriorChainNeighbors(image_t image_id) const;
-  // Removing `image_id` keeps its VIO-prior neighbours close and within the
-  // prior gap. Frames without a prior are not part of the chain.
-  bool CanRemoveFromChain(image_t image_id) const;
+  // Share of 3D points whose track still has length 2.
+  double ShortTrackRatio(image_t image_id) const;
+  // True when deleting `image_id` keeps the configured triangulation angle
+  // for enough of its points.
+  bool KeepsTriangulationParallax(image_t image_id) const;
   // Shared protection rules of culling and capacity eviction.
   bool IsRemovable(image_t image_id,
                    image_t current_id,
@@ -361,8 +404,10 @@ class OnlineMapper {
                         const char* reason,
                         double score) const;
 
-  // Non-keyframe decision for a frame just registered by PnP.
-  bool ShouldSkipKeyframe(image_t image_id) const;
+  // Non-keyframe decision for a frame just registered. Unmatched features and
+  // short tracks count only when `pose_from_pnp` is set; a VIO-prior pose is
+  // not evidence of new structure.
+  bool ShouldSkipKeyframe(image_t image_id, bool pose_from_pnp) const;
   void SkipFrame(image_t image_id);
 
   // Visibility statistics of the points around `image_id` (registered) and
@@ -370,6 +415,8 @@ class OnlineMapper {
   void UpdatePointStats(image_t image_id);
   void EnsureDescriptors(const FlatHashSet<image_t>& image_ids);
   double PointQuality(point3D_t point3D_id) const;
+  // Share of 3D points for which `image_id` is a closest observer.
+  double ClosestObserverRatio(image_t image_id) const;
   std::string PointStatsPath() const;
   void WritePointStats() const;
   void ReadPointStats();
@@ -409,8 +456,16 @@ class OnlineMapper {
     float num_visible = 0.0f;
     float num_found = 0.0f;
     uint32_t last_seen_session = 0;
+    // Checks in a row that did not find the point. Not persisted.
+    int consecutive_misses = 0;
+    // Same, also counting projections with no keypoint nearby.
+    int consecutive_unseen = 0;
   };
+  // Points each keyframe lost to stale removal in this session.
+  std::unordered_map<image_t, size_t> stale_lost_points_;
   std::unordered_map<point3D_t, PointStat> point_stats_;
+  // True when recent checks suggest the point is no longer in the scene.
+  bool PointLooksGone(point3D_t point3D_id) const;
   // Incremented every time a map is resumed from disk.
   uint32_t session_index_ = 0;
   DescriptorLoader descriptor_loader_;

@@ -560,49 +560,67 @@ bool OnlineIncrementalMapper::Process(
     return false;
   }
   if (mapper_->LastFrameSkipped()) {
-    matcher_->ForgetImage(image_id);
-    WriteMappingResult(image_id, {image_id}, {}, mapping_result);
-    return true;
-  }
-
-  bool corrected = false;
-  std::vector<image_t> removed_ids;
-  std::vector<image_t> dirty_ids;
-  if (loop_closer_ && loop_closer_->IsLoopClosureActive()) {
-    corrected = loop_closer_->Process(
-        image_id,
-        image_abs_path,
-        *database_cache_,
-        mapper_->GetReconstruction(),
-        mapper_->GetObservationManager(),
-        matcher_.get(),
-        extracted.bitmap.IsEmpty() ? nullptr : &extracted.bitmap);
-    if (corrected) {
-      const OnlineLoopCorrection& correction = loop_closer_->LastCorrection();
-      mapper_->AdjustLoopBundle(correction.variable_ids, correction.anchor_ids);
-      loop_closer_->FuseAfterLoopBA(mapper_->GetReconstruction(),
-                                    mapper_->GetObservationManager());
-      mapper_->WriteSparse();
-      dirty_ids = correction.variable_ids;
-    }
-  }
-
-  // The loop BA window and fusion just used the frames around the loop.
-  if (!corrected) {
     std::unordered_set<image_t> protected_ids;
     if (loop_closer_) {
       loop_closer_->CollectProtectedImageIds(&protected_ids);
     }
-    for (const image_t culled_id :
-         mapper_->CullRedundantKeyframes(image_id, protected_ids)) {
-      matcher_->ForgetImage(culled_id);
-      removed_ids.push_back(culled_id);
+    std::vector<image_t> removed_ids = {image_id};
+    matcher_->ForgetImage(image_id);
+    for (const image_t stale_id :
+         mapper_->RemoveStaleKeyframes(image_id, protected_ids)) {
+      matcher_->ForgetImage(stale_id);
+      removed_ids.push_back(stale_id);
     }
-    for (const image_t evicted_id :
-         mapper_->EnforceSpatialCapacity(image_id, protected_ids)) {
-      matcher_->ForgetImage(evicted_id);
-      removed_ids.push_back(evicted_id);
-    }
+    WriteMappingResult(image_id, removed_ids, {}, mapping_result);
+    return true;
+  }
+
+  std::vector<image_t> removed_ids;
+  std::vector<image_t> dirty_ids;
+  const OnlineLoopCorrection* correction = nullptr;
+  if (loop_closer_ && loop_closer_->IsLoopClosureActive() &&
+      loop_closer_->Process(
+          image_id,
+          image_abs_path,
+          *database_cache_,
+          mapper_->GetReconstruction(),
+          mapper_->GetObservationManager(),
+          matcher_.get(),
+          extracted.bitmap.IsEmpty() ? nullptr : &extracted.bitmap)) {
+    correction = &loop_closer_->LastCorrection();
+    mapper_->AdjustLoopBundle(correction->variable_ids, correction->anchor_ids);
+    loop_closer_->FuseAfterLoopBA(mapper_->GetReconstruction(),
+                                  mapper_->GetObservationManager());
+    mapper_->WriteSparse();
+    dirty_ids = correction->variable_ids;
+  }
+
+  std::unordered_set<image_t> protected_ids;
+  if (loop_closer_) {
+    loop_closer_->CollectProtectedImageIds(&protected_ids);
+  }
+  const std::vector<image_t> culled_ids =
+      correction == nullptr
+          ? mapper_->CullRedundantKeyframes(image_id, protected_ids)
+          : mapper_->CullRedundantKeyframes(correction->variable_ids,
+                                            protected_ids);
+  for (const image_t culled_id : culled_ids) {
+    matcher_->ForgetImage(culled_id);
+    removed_ids.push_back(culled_id);
+  }
+  const std::vector<image_t> evicted_ids =
+      correction == nullptr
+          ? mapper_->EnforceSpatialCapacity(image_id, protected_ids)
+          : mapper_->EnforceSpatialCapacity(correction->variable_ids,
+                                            protected_ids);
+  for (const image_t evicted_id : evicted_ids) {
+    matcher_->ForgetImage(evicted_id);
+    removed_ids.push_back(evicted_id);
+  }
+  for (const image_t stale_id :
+       mapper_->RemoveStaleKeyframes(image_id, protected_ids)) {
+    matcher_->ForgetImage(stale_id);
+    removed_ids.push_back(stale_id);
   }
 
   WriteMappingResult(image_id, removed_ids, dirty_ids, mapping_result);
