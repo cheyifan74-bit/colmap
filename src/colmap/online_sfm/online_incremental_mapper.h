@@ -57,6 +57,9 @@ struct MappingFrameResult {
   bool registered = false;
   MappingPose cam_from_world;
   std::vector<image_t> removed_ids;
+  // Subset of removed_ids dropped because other keyframes already cover the
+  // same view (redundancy culling, spatial capacity), not because the scene changed.
+  std::vector<image_t> redundant_ids;
   // Keyframes whose pose changed in this call (loop correction), with the pose
   // after the correction.
   std::vector<std::pair<image_t, MappingPose>> dirty_poses;

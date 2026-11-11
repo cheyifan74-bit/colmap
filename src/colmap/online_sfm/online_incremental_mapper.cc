@@ -624,6 +624,11 @@ bool OnlineIncrementalMapper::Process(
   }
 
   WriteMappingResult(image_id, removed_ids, dirty_ids, mapping_result);
+  if (mapping_result != nullptr) {
+    mapping_result->redundant_ids = culled_ids;
+    mapping_result->redundant_ids.insert(mapping_result->redundant_ids.end(),
+                                         evicted_ids.begin(), evicted_ids.end());
+  }
   return true;
 }
 
