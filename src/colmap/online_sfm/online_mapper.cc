@@ -927,6 +927,8 @@ bool OnlineMapper::RegisterRelocalizedFrame(
   pose_priors_[image_id] = vio_cam_from_world;
   reloc_anchor_ids_.insert(image_id);
   initialized_ = true;
+  last_frame_aligned_ = true;
+  ++session_aligned_frames_;
 
   Image& image = reconstruction_->Image(image_id);
   size_t num_attached = 0;
@@ -1521,12 +1523,51 @@ void OnlineMapper::AdjustLoopBundle(const std::vector<image_t>& variable_ids,
     ba_config.SetConstantCamIntrinsics(camera_id);
   }
 
+  const double min_tri_angle_rad =
+      DegToRad(std::max(options_.ba_loop_min_point_tri_angle_deg, 0.0));
+  const auto WellConditioned = [&](const Point3D& point3D) {
+    if (options_.ba_loop_min_point_track_length > 0 &&
+        point3D.track.Length() <
+            static_cast<size_t>(options_.ba_loop_min_point_track_length)) {
+      return false;
+    }
+    if (min_tri_angle_rad <= 0.0) {
+      return true;
+    }
+    std::vector<Eigen::Vector3d> centers;
+    centers.reserve(point3D.track.Length());
+    for (const TrackElement& el : point3D.track.Elements()) {
+      const Image& image = reconstruction_->Image(el.image_id);
+      if (image.HasPose()) {
+        centers.push_back(image.ProjectionCenter());
+      }
+    }
+    for (size_t i = 0; i < centers.size(); ++i) {
+      for (size_t j = i + 1; j < centers.size(); ++j) {
+        if (CalculateTriangulationAngle(centers[i], centers[j], point3D.xyz) >=
+            min_tri_angle_rad) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
   FlatHashSet<point3D_t> variable_point3D_ids;
+  FlatHashSet<point3D_t> constant_point3D_ids;
   for (const image_t id : used_variable) {
     for (const Point2D& point2D : reconstruction_->Image(id).Points2D()) {
-      if (point2D.HasPoint3D() &&
-          variable_point3D_ids.insert(point2D.point3D_id).second) {
+      if (!point2D.HasPoint3D() ||
+          variable_point3D_ids.count(point2D.point3D_id) > 0 ||
+          constant_point3D_ids.count(point2D.point3D_id) > 0) {
+        continue;
+      }
+      if (WellConditioned(reconstruction_->Point3D(point2D.point3D_id))) {
+        variable_point3D_ids.insert(point2D.point3D_id);
         ba_config.AddVariablePoint(point2D.point3D_id);
+      } else {
+        constant_point3D_ids.insert(point2D.point3D_id);
+        ba_config.AddConstantPoint(point2D.point3D_id);
       }
     }
   }
@@ -1570,17 +1611,54 @@ void OnlineMapper::AdjustLoopBundle(const std::vector<image_t>& variable_ids,
                                 bundle_adjuster->Problem().get(),
                                 prior_loss.get(),
                                 &free_ids);
+
+  // The frames enter the solve at their pose-graph poses.
+  size_t num_pose_priors = 0;
+  if (options_.ba_loop_pose_prior_rot_sigma_deg > 0.0 &&
+      options_.ba_loop_pose_prior_trans_sigma_m > 0.0) {
+    ceres::Problem* problem = bundle_adjuster->Problem().get();
+    Eigen::Matrix<double, 6, 6> cov = Eigen::Matrix<double, 6, 6>::Zero();
+    cov.diagonal().head<3>().setConstant(
+        std::pow(DegToRad(options_.ba_loop_pose_prior_rot_sigma_deg), 2));
+    cov.diagonal().tail<3>().setConstant(
+        std::pow(options_.ba_loop_pose_prior_trans_sigma_m, 2));
+    FlatHashSet<frame_t> prior_frame_ids;
+    for (const image_t id : used_variable) {
+      const Image& image = reconstruction_->Image(id);
+      if (!image.IsRefInFrame() ||
+          !prior_frame_ids.insert(image.FrameId()).second) {
+        continue;
+      }
+      Rigid3d& rig_from_world = image.FramePtr()->RigFromWorld();
+      double* params = rig_from_world.params.data();
+      if (!problem->HasParameterBlock(params) ||
+          problem->IsParameterBlockConstant(params)) {
+        continue;
+      }
+      problem->AddResidualBlock(
+          CovarianceWeightedCostFunctor<AbsolutePosePriorCostFunctor>::Create(
+              cov, rig_from_world),
+          nullptr,
+          params);
+      ++num_pose_priors;
+    }
+  }
+
   const auto summary = bundle_adjuster->Solve();
   if (!summary || !summary->IsSolutionUsable()) {
     LOG(WARNING) << "OnlineMapper: loop BA failed, variable="
                  << JoinImageIds(used_variable)
-                 << " vio_priors=" << num_vio_priors;
+                 << " vio_priors=" << num_vio_priors
+                 << " pose_priors=" << num_pose_priors;
     return;
   }
+  last_frame_aligned_ = true;
   LOG(INFO) << "OnlineMapper: loop BA variable=[" << JoinImageIds(used_variable)
             << "] anchors=" << num_anchors
             << " points=" << variable_point3D_ids.size()
+            << " const_points=" << constant_point3D_ids.size()
             << " vio_priors=" << num_vio_priors
+            << " pose_priors=" << num_pose_priors
             << " max_iterations=" << options_.ba_loop_max_num_iterations
             << " residuals=" << summary->num_residuals;
 
@@ -1802,6 +1880,12 @@ bool OnlineMapper::IsRemovable(const image_t image_id,
   return pose_priors_.count(image_id) > 0 || allow_prior_session;
 }
 
+bool OnlineMapper::PriorSessionEditable() const {
+  return last_frame_aligned_ &&
+         session_aligned_frames_ >=
+             static_cast<size_t>(std::max(options_.capacity_min_session_frames, 0));
+}
+
 std::vector<image_t> OnlineMapper::CullRedundantKeyframes(
     const image_t image_id, const std::unordered_set<image_t>& protected_ids) {
   if (!options_.cull_enabled || !initialized_ || !obs_manager_ ||
@@ -1829,6 +1913,8 @@ std::vector<image_t> OnlineMapper::CullRedundantKeyframes(
       std::max(options_.cull_protect_short_track_ratio, 0.0);
   const size_t max_culled =
       static_cast<size_t>(std::max(options_.cull_max_per_frame, 0));
+  const bool allow_prior_session =
+      options_.cull_prior_session && PriorSessionEditable();
 
   for (size_t num_removed = 0; num_removed < max_culled; ++num_removed) {
     const FlatHashSet<image_t> recent_ids = RecentRegisteredIds();
@@ -1842,7 +1928,7 @@ std::vector<image_t> OnlineMapper::CullRedundantKeyframes(
       if (!reconstruction_->ExistsImage(id) ||
           !reconstruction_->Image(id).HasPose() ||
           protected_ids.count(id) > 0 || reloc_anchor_ids_.count(id) > 0 ||
-          (pose_priors_.count(id) == 0 && !options_.cull_prior_session)) {
+          (pose_priors_.count(id) == 0 && !allow_prior_session)) {
         continue;
       }
       if (short_track_limit > 0.0 && recent_ids.count(id) > 0 &&
@@ -1959,9 +2045,7 @@ std::vector<image_t> OnlineMapper::EnforceSpatialCapacity(
   const double new_score = score_of(image_id);
 
   const FlatHashSet<image_t> recent_ids = RecentRegisteredIds();
-  const bool allow_prior_session =
-      session_mapped_frames_ >=
-      static_cast<size_t>(std::max(options_.capacity_min_session_frames, 0));
+  const bool allow_prior_session = PriorSessionEditable();
   std::vector<std::pair<double, image_t>> scored;
   for (const image_t id : members) {
     if (id == image_id ||
@@ -2128,9 +2212,7 @@ std::vector<image_t> OnlineMapper::EnforceSpatialCapacity(
 
   std::vector<char> consumed(queries.size(), 0);
   const FlatHashSet<image_t> recent_ids = RecentRegisteredIds();
-  const bool allow_prior_session =
-      session_mapped_frames_ >=
-      static_cast<size_t>(std::max(options_.capacity_min_session_frames, 0));
+  const bool allow_prior_session = PriorSessionEditable();
   FlatHashSet<image_t> gone;
 
   for (size_t i = 0; i < queries.size(); ++i) {
@@ -2218,9 +2300,7 @@ std::vector<image_t> OnlineMapper::RemoveStaleKeyframes(
     return removed;
   }
   const FlatHashSet<image_t> recent_ids = RecentRegisteredIds();
-  const bool allow_prior_session =
-      session_mapped_frames_ >=
-      static_cast<size_t>(std::max(options_.capacity_min_session_frames, 0));
+  const bool allow_prior_session = PriorSessionEditable();
   const size_t min_points =
       static_cast<size_t>(std::max(options_.stale_frame_min_points, 0));
   std::vector<std::pair<double, image_t>> candidates;
@@ -2452,7 +2532,10 @@ void OnlineMapper::UpdatePointStats(const image_t image_id) {
                           return pose_priors_.count(el.image_id) > 0;
                         });
   };
-  const bool unseen_enabled = options_.stale_max_consecutive_unseen > 0;
+  const bool counts_misses =
+      !options_.stale_require_aligned || last_frame_aligned_;
+  const bool unseen_enabled =
+      counts_misses && options_.stale_max_consecutive_unseen > 0;
   const double min_found_ratio = options_.stale_max_found_ratio;
   const float min_visible =
       static_cast<float>(std::max(options_.stale_min_visible, 1));
@@ -2462,10 +2545,14 @@ void OnlineMapper::UpdatePointStats(const image_t image_id) {
   std::vector<point3D_t> stale;
   for (const point3D_t id : visible) {
     const Point3D& point3D = reconstruction_->Point3D(id);
+    const bool found = matched.count(id) > 0;
+    if (!found && !counts_misses) {
+      continue;
+    }
     ++num_checked;
     PointStat& stat = point_stats_[id];
     stat.num_visible += 1.0f;
-    if (matched.count(id) > 0) {
+    if (found) {
       ++num_matched;
       stat.num_found += 1.0f;
       stat.last_seen_session = session_index_;
@@ -2519,6 +2606,7 @@ void OnlineMapper::UpdatePointStats(const image_t image_id) {
             << " observed=" << observed.size() << " checked=" << num_checked
             << " matched=" << num_matched << " bare=" << num_bare
             << " stale_removed=" << stale.size()
+            << " aligned=" << last_frame_aligned_
             << " points3D=" << reconstruction_->NumPoints3D();
 }
 
@@ -2746,6 +2834,7 @@ void OnlineMapper::MaybeWriteSparse() {
 bool OnlineMapper::MappingCurrentImage(const image_t image_id,
                                        const std::optional<Rigid3d>& vio_prior) {
   last_frame_skipped_ = false;
+  last_frame_aligned_ = false;
   if (!SyncReconstruction()) {
     return false;
   }
@@ -2782,10 +2871,13 @@ bool OnlineMapper::MappingCurrentImage(const image_t image_id,
   }
 
   if (prior_reg.success) {
+    last_frame_aligned_ = true;
+    ++session_aligned_frames_;
     ExtendTracksByProjection(image_id, "register");
   }
-  // VIO-fallback frames vote too: PnP fails mostly where the scene changed.
   // Frames about to be skipped still vote: a revisit is mostly skipped frames.
+  // VIO-fallback frames only count found points unless stale_require_aligned
+  // is off.
   if (options_.point_stats_enabled) {
     UpdatePointStats(image_id);
   }

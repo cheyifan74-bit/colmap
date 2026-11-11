@@ -101,6 +101,15 @@ struct OnlineMapperOptions {
   // Loop BA refines the whole pose-graph-corrected chain, so it needs more
   // iterations than the per-keyframe local BA (fixed at 10).
   int ba_loop_max_num_iterations = 50;
+  // Loop BA also ties every chain frame to its pose-graph pose, so directions
+  // the observations leave unconstrained stay at the graph solution instead
+  // of drifting. <= 0 disables.
+  double ba_loop_pose_prior_rot_sigma_deg = 2.0;
+  double ba_loop_pose_prior_trans_sigma_m = 0.05;
+  // Loop BA holds points with a shorter track or a smaller max triangulation
+  // angle constant; their depth is too weak to refine. <= 0 disables each.
+  int ba_loop_min_point_track_length = 3;
+  double ba_loop_min_point_tri_angle_deg = 2.0;
   // Local BA windows smaller than this (current + covisible frames) are padded
   // with up to `ba_temporal_window_images` most recent registered frames.
   int ba_min_window_images = 4;
@@ -160,6 +169,10 @@ struct OnlineMapperOptions {
   double stale_max_found_ratio = 0.25;
   // Only points not observed by any keyframe of this session are judged.
   bool stale_prior_session_only = true;
+  // Only frames whose pose came from PnP against the map (or relocalization)
+  // count misses. A VIO-fallback pose may be offset from the map, so its
+  // missed projections say nothing about the scene.
+  bool stale_require_aligned = true;
   // A point missed by this many checks in a row is removed regardless of its
   // lifetime found ratio, so a changed scene is dropped quickly. <=0 disables.
   int stale_max_consecutive_misses = 5;
@@ -194,8 +207,9 @@ struct OnlineMapperOptions {
   double capacity_boundary_m = 0.2;
   int capacity_max_per_cell = 2;
   double capacity_replace_ratio = 0.8;
-  // Keyframes of previous sessions are replaced only after this session has
-  // mapped this many keyframes since initialization / relocalization.
+  // Keyframes of previous sessions are culled, evicted or dropped as stale only
+  // after this session has aligned this many frames to the map (PnP or
+  // relocalization), and only while the current frame is aligned.
   int capacity_min_session_frames = 20;
   IncrementalTriangulator::Options triangulation;
 
@@ -399,6 +413,9 @@ class OnlineMapper {
                    const FlatHashSet<image_t>& recent_ids,
                    const std::unordered_set<image_t>& protected_ids,
                    bool allow_prior_session) const;
+  // Previous-session keyframes may be removed: the current frame is aligned to
+  // the map and enough frames of this session were.
+  bool PriorSessionEditable() const;
   FlatHashSet<image_t> RecentRegisteredIds() const;
   void AppendCullRecord(image_t image_id,
                         const char* reason,
@@ -484,6 +501,10 @@ class OnlineMapper {
   bool last_frame_skipped_ = false;
   // Keyframes mapped since initialization / relocalization in this session.
   size_t session_mapped_frames_ = 0;
+  // The frame being mapped got its pose from the map (PnP, relocalization or
+  // loop correction), not from VIO alone.
+  bool last_frame_aligned_ = false;
+  size_t session_aligned_frames_ = 0;
   bool initialized_ = false;
   // Map updates since the last sparse flush. Reset by WriteSparse().
   mutable int sparse_writes_since_flush_ = 0;
