@@ -618,11 +618,6 @@ image_t OnlineMapper::FindLastRegisteredWithPrior(
 Rigid3d OnlineMapper::MapFrameCamFromWorld(const image_t image_id,
                                            const Rigid3d& vio_prior) const {
   const image_t last_id = FindLastRegisteredWithPrior(image_id);
-  if (tracking_anchor_ && tracking_anchor_->image_id < image_id &&
-      (last_id == kInvalidImageId || tracking_anchor_->image_id > last_id)) {
-    return vio_prior * Inverse(tracking_anchor_->vio_cam_from_world) *
-           tracking_anchor_->cam_from_world;
-  }
   if (last_id == kInvalidImageId) {
     return vio_prior;
   }
@@ -869,7 +864,6 @@ bool OnlineMapper::LoadSparseMap(
   for (const image_t image_id : reconstruction_->RegImageIds()) {
     registered_image_names->push_back(reconstruction_->Image(image_id).Name());
   }
-  ReadPointStats();
   ReadVioPriors();
   LOG(INFO) << "OnlineMapper: loaded sparse map "
             << sparse_path_ << " frames=" << reconstruction_->NumRegImages()
@@ -925,10 +919,7 @@ bool OnlineMapper::RegisterRelocalizedFrame(
   // VIO-frame prior only. Using the map pose here would poison the chain that
   // MapFrameCamFromWorld() uses for every following frame.
   pose_priors_[image_id] = vio_cam_from_world;
-  reloc_anchor_ids_.insert(image_id);
   initialized_ = true;
-  last_frame_aligned_ = true;
-  ++session_aligned_frames_;
 
   Image& image = reconstruction_->Image(image_id);
   size_t num_attached = 0;
@@ -1652,7 +1643,6 @@ void OnlineMapper::AdjustLoopBundle(const std::vector<image_t>& variable_ids,
                  << " pose_priors=" << num_pose_priors;
     return;
   }
-  last_frame_aligned_ = true;
   LOG(INFO) << "OnlineMapper: loop BA variable=[" << JoinImageIds(used_variable)
             << "] anchors=" << num_anchors
             << " points=" << variable_point3D_ids.size()
@@ -1674,139 +1664,6 @@ image_t OnlineMapper::KeyframeGap(const image_t id_i, const image_t id_j) const 
   const auto num_culled = std::distance(culled_ids_.lower_bound(lo),
                                         culled_ids_.lower_bound(hi));
   return hi - lo - static_cast<image_t>(num_culled);
-}
-
-double OnlineMapper::RedundantPointRatio(const image_t image_id,
-                                         size_t* num_points) const {
-  *num_points = 0;
-  const Image& image = reconstruction_->Image(image_id);
-  const Eigen::Vector3d center = image.ProjectionCenter();
-  const double max_scale_sq =
-      options_.cull_max_scale_ratio * options_.cull_max_scale_ratio;
-  const int min_observers = std::max(options_.cull_min_other_observers, 1);
-  std::unordered_map<image_t, Eigen::Vector3d> centers;
-  const auto center_of = [&](const image_t id) -> const Eigen::Vector3d& {
-    auto it = centers.find(id);
-    if (it == centers.end()) {
-      it = centers.emplace(id, reconstruction_->Image(id).ProjectionCenter())
-               .first;
-    }
-    return it->second;
-  };
-
-  size_t num_redundant = 0;
-  FlatHashSet<image_t> counted;
-  for (const Point2D& point2D : image.Points2D()) {
-    if (!point2D.HasPoint3D() ||
-        !reconstruction_->ExistsPoint3D(point2D.point3D_id)) {
-      continue;
-    }
-    ++(*num_points);
-    const Point3D& point3D = reconstruction_->Point3D(point2D.point3D_id);
-    const double own_dist_sq = (point3D.xyz - center).squaredNorm();
-    counted.clear();
-    int num_observers = 0;
-    for (const TrackElement& el : point3D.track.Elements()) {
-      if (el.image_id == image_id || !counted.insert(el.image_id).second) {
-        continue;
-      }
-      const Image& other = reconstruction_->Image(el.image_id);
-      if (!other.HasPose()) {
-        continue;
-      }
-      if ((point3D.xyz - center_of(el.image_id)).squaredNorm() <=
-          max_scale_sq * own_dist_sq) {
-        if (++num_observers >= min_observers) {
-          break;
-        }
-      }
-    }
-    if (num_observers >= min_observers) {
-      ++num_redundant;
-    }
-  }
-  return *num_points > 0
-             ? static_cast<double>(num_redundant) / static_cast<double>(*num_points)
-             : 0.0;
-}
-
-double OnlineMapper::ShortTrackRatio(const image_t image_id) const {
-  const Image& image = reconstruction_->Image(image_id);
-  size_t num_points = 0;
-  size_t num_short = 0;
-  for (const Point2D& point2D : image.Points2D()) {
-    if (!point2D.HasPoint3D() ||
-        !reconstruction_->ExistsPoint3D(point2D.point3D_id)) {
-      continue;
-    }
-    ++num_points;
-    if (reconstruction_->Point3D(point2D.point3D_id).track.Length() == 2) {
-      ++num_short;
-    }
-  }
-  return num_points > 0
-             ? static_cast<double>(num_short) / static_cast<double>(num_points)
-             : 0.0;
-}
-
-bool OnlineMapper::KeepsTriangulationParallax(const image_t image_id) const {
-  const Image& image = reconstruction_->Image(image_id);
-  const double min_multi_angle = options_.filter_min_tri_angle > 0.0
-                                     ? DegToRad(options_.filter_min_tri_angle)
-                                     : 0.0;
-  const double min_two_view_angle =
-      options_.filter_two_view_min_tri_angle > 0.0
-          ? DegToRad(options_.filter_two_view_min_tri_angle)
-          : 0.0;
-  size_t num_points = 0;
-  size_t num_failed = 0;
-  std::vector<Eigen::Vector3d> centers;
-  FlatHashSet<image_t> counted;
-  for (const Point2D& point2D : image.Points2D()) {
-    if (!point2D.HasPoint3D() ||
-        !reconstruction_->ExistsPoint3D(point2D.point3D_id)) {
-      continue;
-    }
-    ++num_points;
-    const Point3D& point3D = reconstruction_->Point3D(point2D.point3D_id);
-    centers.clear();
-    counted.clear();
-    for (const TrackElement& el : point3D.track.Elements()) {
-      if (el.image_id == image_id || !counted.insert(el.image_id).second) {
-        continue;
-      }
-      const Image& other = reconstruction_->Image(el.image_id);
-      if (!other.HasPose()) {
-        continue;
-      }
-      centers.push_back(other.ProjectionCenter());
-    }
-    const double min_angle =
-        centers.size() >= 3 ? min_multi_angle : min_two_view_angle;
-    if (centers.size() < 2 || min_angle <= 0.0) {
-      if (centers.size() < 2) {
-        ++num_failed;
-      }
-      continue;
-    }
-    double max_angle = 0.0;
-    for (size_t i = 0; i < centers.size(); ++i) {
-      for (size_t j = i + 1; j < centers.size(); ++j) {
-        max_angle = std::max(
-            max_angle,
-            CalculateTriangulationAngle(centers[i], centers[j], point3D.xyz));
-      }
-    }
-    if (max_angle <= min_angle) {
-      ++num_failed;
-    }
-  }
-  if (num_points == 0) {
-    return false;
-  }
-  const double fail_ratio =
-      static_cast<double>(num_failed) / static_cast<double>(num_points);
-  return fail_ratio <= std::max(options_.cull_max_parallax_fail_ratio, 0.0);
 }
 
 void OnlineMapper::AppendCullRecord(const image_t image_id,
@@ -1858,134 +1715,16 @@ bool OnlineMapper::RemoveKeyframe(const image_t image_id,
   return true;
 }
 
-FlatHashSet<image_t> OnlineMapper::RecentRegisteredIds() const {
-  std::vector<image_t> reg_ids = reconstruction_->RegImageIds();
-  std::sort(reg_ids.begin(), reg_ids.end(), std::greater<image_t>());
-  const size_t num_recent = std::min(
-      reg_ids.size(),
-      static_cast<size_t>(std::max(options_.cull_protect_recent, 0)));
-  return FlatHashSet<image_t>(reg_ids.begin(), reg_ids.begin() + num_recent);
-}
-
-bool OnlineMapper::IsRemovable(const image_t image_id,
-                               const image_t current_id,
-                               const FlatHashSet<image_t>& recent_ids,
-                               const std::unordered_set<image_t>& protected_ids,
-                               const bool allow_prior_session) const {
-  if (image_id == current_id || recent_ids.count(image_id) > 0 ||
-      protected_ids.count(image_id) > 0 ||
-      reloc_anchor_ids_.count(image_id) > 0) {
-    return false;
-  }
-  return pose_priors_.count(image_id) > 0 || allow_prior_session;
-}
-
-bool OnlineMapper::PriorSessionEditable() const {
-  return last_frame_aligned_ &&
-         session_aligned_frames_ >=
-             static_cast<size_t>(std::max(options_.capacity_min_session_frames, 0));
-}
-
-std::vector<image_t> OnlineMapper::CullRedundantKeyframes(
-    const image_t image_id, const std::unordered_set<image_t>& protected_ids) {
-  if (!options_.cull_enabled || !initialized_ || !obs_manager_ ||
-      !reconstruction_->ExistsImage(image_id) ||
-      !reconstruction_->Image(image_id).HasPose()) {
-    return {};
-  }
-  std::vector<image_t> local_ids;
-  std::vector<image_t> constant_ids;
-  BuildCovisibilityBundle(image_id, &local_ids, &constant_ids);
-  return CullRedundantKeyframes(local_ids, protected_ids);
-}
-
-std::vector<image_t> OnlineMapper::CullRedundantKeyframes(
-    const std::vector<image_t>& candidate_ids,
-    const std::unordered_set<image_t>& protected_ids) {
-  std::vector<image_t> culled;
-  if (!options_.cull_enabled || !initialized_ || !obs_manager_) {
-    return culled;
-  }
-
-  const size_t min_points =
-      static_cast<size_t>(std::max(options_.cull_min_num_points, 0));
-  const double short_track_limit =
-      std::max(options_.cull_protect_short_track_ratio, 0.0);
-  const size_t max_culled =
-      static_cast<size_t>(std::max(options_.cull_max_per_frame, 0));
-  const bool allow_prior_session =
-      options_.cull_prior_session && PriorSessionEditable();
-
-  for (size_t num_removed = 0; num_removed < max_culled; ++num_removed) {
-    const FlatHashSet<image_t> recent_ids = RecentRegisteredIds();
-    struct Candidate {
-      double unique_ratio = 0.0;
-      image_t image_id = kInvalidImageId;
-    };
-    std::vector<Candidate> ranked;
-    ranked.reserve(candidate_ids.size());
-    for (const image_t id : candidate_ids) {
-      if (!reconstruction_->ExistsImage(id) ||
-          !reconstruction_->Image(id).HasPose() ||
-          protected_ids.count(id) > 0 || reloc_anchor_ids_.count(id) > 0 ||
-          (pose_priors_.count(id) == 0 && !allow_prior_session)) {
-        continue;
-      }
-      if (short_track_limit > 0.0 && recent_ids.count(id) > 0 &&
-          ShortTrackRatio(id) >= short_track_limit) {
-        continue;
-      }
-      size_t num_points = 0;
-      const double redundant_ratio = RedundantPointRatio(id, &num_points);
-      if (num_points < min_points ||
-          redundant_ratio < options_.cull_redundant_ratio) {
-        continue;
-      }
-      ranked.push_back({1.0 - redundant_ratio, id});
-    }
-    std::sort(ranked.begin(), ranked.end(), [](const Candidate& a, const Candidate& b) {
-      if (a.unique_ratio != b.unique_ratio) {
-        return a.unique_ratio < b.unique_ratio;
-      }
-      return a.image_id > b.image_id;
-    });
-
-    bool removed = false;
-    for (const Candidate& candidate : ranked) {
-      if (!KeepsTriangulationParallax(candidate.image_id)) {
-        LOG(INFO) << "OnlineMapper: keep keyframe " << candidate.image_id
-                  << " unique_ratio=" << candidate.unique_ratio
-                  << ", remaining parallax would collapse";
-        continue;
-      }
-      if (RemoveKeyframe(candidate.image_id, "redundant", candidate.unique_ratio)) {
-        LOG(INFO) << "OnlineMapper: culled redundant keyframe "
-                  << candidate.image_id
-                  << " unique_ratio=" << candidate.unique_ratio;
-        culled.push_back(candidate.image_id);
-        removed = true;
-        break;
-      }
-    }
-    if (!removed) {
-      break;
-    }
-  }
-  return culled;
-}
-
-std::vector<image_t> OnlineMapper::EnforceSpatialCapacity(
-    const image_t image_id, const std::unordered_set<image_t>& protected_ids) {
-  std::vector<image_t> evicted;
+std::vector<image_t> OnlineMapper::EnforceSpatialCapacity(const image_t image_id) {
+  std::vector<image_t> replaced;
   if (!options_.capacity_enabled || !initialized_ || !obs_manager_ ||
       options_.capacity_voxel_m <= 0.0 || options_.capacity_max_per_cell < 1 ||
       !reconstruction_->ExistsImage(image_id) ||
       !reconstruction_->Image(image_id).HasPose()) {
-    return evicted;
+    return replaced;
   }
 
   const double voxel_m = options_.capacity_voxel_m;
-  const double boundary_m = std::max(options_.capacity_boundary_m, 0.0);
   const double cos_view =
       options_.capacity_view_angle_deg > 0.0
           ? std::cos(DegToRad(options_.capacity_view_angle_deg))
@@ -2000,415 +1739,58 @@ std::vector<image_t> OnlineMapper::EnforceSpatialCapacity(
     return image.CamFromWorld().rotation().inverse() * Eigen::Vector3d::UnitZ();
   };
 
+  // A cell is one voxel plus one viewing direction. The frame belongs to
+  // exactly its own voxel; the direction test uses its optimized pose.
   const Image& current = reconstruction_->Image(image_id);
-  const Eigen::Vector3d current_center = current.ProjectionCenter();
-  const Eigen::Vector3d current_axis = axis_of(current);
-  const auto current_voxel = voxel_of(current_center);
-  std::vector<std::array<int64_t, 3>> cells;
-  cells.push_back(current_voxel);
-  for (int axis = 0; axis < 3; ++axis) {
-    const double origin = static_cast<double>(current_voxel[axis]) * voxel_m;
-    const double local = current_center[axis] - origin;
-    if (local < boundary_m) {
-      auto neighbor = current_voxel;
-      neighbor[axis] -= 1;
-      cells.push_back(neighbor);
-    }
-    if (voxel_m - local < boundary_m) {
-      auto neighbor = current_voxel;
-      neighbor[axis] += 1;
-      cells.push_back(neighbor);
-    }
-  }
-
+  const auto cell = voxel_of(current.ProjectionCenter());
+  const Eigen::Vector3d axis = axis_of(current);
   std::vector<image_t> members;
   for (const image_t id : reconstruction_->RegImageIds()) {
     const Image& image = reconstruction_->Image(id);
-    if (!image.HasPose() ||
-        axis_of(image).dot(current_axis) <= cos_view) {
+    if (!image.HasPose() || axis_of(image).dot(axis) <= cos_view ||
+        voxel_of(image.ProjectionCenter()) != cell) {
       continue;
     }
-    const auto voxel = voxel_of(image.ProjectionCenter());
-    if (std::find(cells.begin(), cells.end(), voxel) != cells.end()) {
-      members.push_back(id);
-    }
+    members.push_back(id);
   }
-  const size_t max_per_cell =
-      static_cast<size_t>(options_.capacity_max_per_cell);
-  if (members.size() <= max_per_cell) {
-    return evicted;
+  const size_t keep = static_cast<size_t>(options_.capacity_max_per_cell);
+  if (members.size() <= keep) {
+    return replaced;
   }
 
-  const auto score_of = [&](const image_t id) {
-    return ClosestObserverRatio(id);
-  };
-  const double new_score = score_of(image_id);
-
-  const FlatHashSet<image_t> recent_ids = RecentRegisteredIds();
-  const bool allow_prior_session = PriorSessionEditable();
-  std::vector<std::pair<double, image_t>> scored;
-  for (const image_t id : members) {
-    if (id == image_id ||
-        !IsRemovable(
-            id, image_id, recent_ids, protected_ids, allow_prior_session)) {
-      continue;
-    }
-    scored.emplace_back(score_of(id), id);
-  }
-  std::sort(scored.begin(), scored.end());
-
-  // Existing keyframes are replaced only when clearly worse than the new one.
-  const size_t excess = members.size() - max_per_cell;
-  const double replace_below = options_.capacity_replace_ratio * new_score;
-  for (const auto& [score, id] : scored) {
-    if (evicted.size() >= excess || score >= replace_below) {
-      break;
-    }
-    if (RemoveKeyframe(id, "capacity", score)) {
-      LOG(INFO) << "OnlineMapper: evicted keyframe " << id << " from cell of "
-                << image_id << " members=" << members.size()
-                << " score=" << score << " new_score=" << new_score;
-      evicted.push_back(id);
+  // Newest keyframes stay, so the frame just optimized replaces the older
+  // ones and the cell shows the latest pass over the scene.
+  std::sort(members.begin(), members.end(), std::greater<image_t>());
+  const size_t held = members.size();
+  for (size_t i = keep; i < members.size(); ++i) {
+    if (RemoveKeyframe(members[i], "grid", 0.0)) {
+      replaced.push_back(members[i]);
     }
   }
-  if (evicted.size() >= excess) {
-    consecutive_capacity_drops_ = 0;
-    return evicted;
-  }
-
-  // Otherwise drop the new keyframe, as a non-keyframe. Bounded so a revisit
-  // still refreshes the map now and then.
-  if (protected_ids.count(image_id) > 0 ||
-      reloc_anchor_ids_.count(image_id) > 0 ||
-      consecutive_capacity_drops_ >=
-          std::max(options_.insert_max_consecutive_skips, 0)) {
-    consecutive_capacity_drops_ = 0;
-    return evicted;
-  }
-  const auto prior_it = pose_priors_.find(image_id);
-  if (prior_it != pose_priors_.end()) {
-    tracking_anchor_ = TrackingAnchor{
-        image_id, prior_it->second, reconstruction_->Image(image_id).CamFromWorld()};
-  }
-  if (RemoveKeyframe(image_id, "capacity_new", new_score)) {
-    ++consecutive_capacity_drops_;
-    LOG(INFO) << "OnlineMapper: dropped new keyframe " << image_id
-              << ", cell already holds " << members.size() - 1
-              << " keyframe(s) of score >= " << replace_below;
-    evicted.push_back(image_id);
-  }
-  return evicted;
+  LOG(INFO) << "OnlineMapper: grid cell of keyframe " << image_id << " held "
+            << held << ", replaced " << replaced.size()
+            << " older keyframe(s), frames=" << reconstruction_->NumRegFrames()
+            << " points3D=" << reconstruction_->NumPoints3D();
+  return replaced;
 }
 
 std::vector<image_t> OnlineMapper::EnforceSpatialCapacity(
-    const std::vector<image_t>& image_ids,
-    const std::unordered_set<image_t>& protected_ids) {
-  std::vector<image_t> evicted;
-  if (!options_.capacity_enabled || !initialized_ || !obs_manager_ ||
-      options_.capacity_voxel_m <= 0.0 || options_.capacity_max_per_cell < 1 ||
-      image_ids.empty()) {
-    return evicted;
-  }
-
-  const double voxel_m = options_.capacity_voxel_m;
-  const double boundary_m = std::max(options_.capacity_boundary_m, 0.0);
-  const double cos_view =
-      options_.capacity_view_angle_deg > 0.0
-          ? std::cos(DegToRad(options_.capacity_view_angle_deg))
-          : -1.0;
-  const size_t max_per_cell =
-      static_cast<size_t>(options_.capacity_max_per_cell);
-  const auto voxel_of = [&](const Eigen::Vector3d& center) {
-    return std::array<int64_t, 3>{
-        static_cast<int64_t>(std::floor(center.x() / voxel_m)),
-        static_cast<int64_t>(std::floor(center.y() / voxel_m)),
-        static_cast<int64_t>(std::floor(center.z() / voxel_m))};
-  };
-  const auto axis_of = [](const Image& image) {
-    return image.CamFromWorld().rotation().inverse() * Eigen::Vector3d::UnitZ();
-  };
-  const auto cells_of = [&](const Eigen::Vector3d& center,
-                            const std::array<int64_t, 3>& voxel) {
-    std::vector<std::array<int64_t, 3>> cells;
-    cells.push_back(voxel);
-    for (int axis = 0; axis < 3; ++axis) {
-      const double local =
-          center[axis] - static_cast<double>(voxel[axis]) * voxel_m;
-      if (local < boundary_m) {
-        auto neighbor = voxel;
-        neighbor[axis] -= 1;
-        cells.push_back(neighbor);
-      }
-      if (voxel_m - local < boundary_m) {
-        auto neighbor = voxel;
-        neighbor[axis] += 1;
-        cells.push_back(neighbor);
-      }
-    }
-    std::sort(cells.begin(), cells.end());
-    return cells;
-  };
-
-  struct VoxelKey {
-    std::array<int64_t, 3> voxel;
-    bool operator==(const VoxelKey& other) const { return voxel == other.voxel; }
-  };
-  struct VoxelKeyHash {
-    size_t operator()(const VoxelKey& key) const {
-      return (static_cast<size_t>(key.voxel[0]) * 73856093u) ^
-             (static_cast<size_t>(key.voxel[1]) * 19349663u) ^
-             (static_cast<size_t>(key.voxel[2]) * 83492791u);
-    }
-  };
-  struct PoseRecord {
-    image_t id = kInvalidImageId;
-    Eigen::Vector3d center = Eigen::Vector3d::Zero();
-    Eigen::Vector3d axis = Eigen::Vector3d::UnitZ();
-    std::array<int64_t, 3> voxel{};
-
-    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-  };
-
-  std::vector<PoseRecord, Eigen::aligned_allocator<PoseRecord>> records;
-  std::unordered_map<VoxelKey, std::vector<size_t>, VoxelKeyHash> buckets;
-  records.reserve(reconstruction_->NumRegFrames());
-  for (const image_t id : reconstruction_->RegImageIds()) {
-    const Image& image = reconstruction_->Image(id);
-    if (!image.HasPose()) {
-      continue;
-    }
-    PoseRecord record;
-    record.id = id;
-    record.center = image.ProjectionCenter();
-    record.axis = axis_of(image);
-    record.voxel = voxel_of(record.center);
-    buckets[VoxelKey{record.voxel}].push_back(records.size());
-    records.push_back(record);
-  }
-
-  std::unordered_map<image_t, size_t> record_of;
-  record_of.reserve(records.size());
-  for (size_t i = 0; i < records.size(); ++i) {
-    record_of.emplace(records[i].id, i);
-  }
-
-  struct Query {
-    size_t record_index = 0;
-    std::vector<std::array<int64_t, 3>> cells;
-  };
-  std::vector<Query> queries;
-  FlatHashSet<image_t> queued;
-  for (const image_t id : image_ids) {
-    const auto it = record_of.find(id);
-    if (it == record_of.end() || !queued.insert(id).second) {
-      continue;
-    }
-    const PoseRecord& record = records[it->second];
-    queries.push_back({it->second, cells_of(record.center, record.voxel)});
-  }
-  std::sort(queries.begin(), queries.end(), [](const Query& a, const Query& b) {
-    return a.record_index < b.record_index;
-  });
-
-  std::vector<char> consumed(queries.size(), 0);
-  const FlatHashSet<image_t> recent_ids = RecentRegisteredIds();
-  const bool allow_prior_session = PriorSessionEditable();
-  FlatHashSet<image_t> gone;
-
-  for (size_t i = 0; i < queries.size(); ++i) {
-    if (consumed[i] || gone.count(records[queries[i].record_index].id) > 0) {
-      continue;
-    }
-    const PoseRecord& seed = records[queries[i].record_index];
-    const auto& cells = queries[i].cells;
-    consumed[i] = 1;
-    for (size_t j = i + 1; j < queries.size(); ++j) {
-      if (consumed[j]) {
-        continue;
-      }
-      const PoseRecord& other = records[queries[j].record_index];
-      if (other.axis.dot(seed.axis) > cos_view && queries[j].cells == cells) {
-        consumed[j] = 1;
-      }
-    }
-
-    FlatHashSet<image_t> seen;
-    std::vector<image_t> members;
-    for (const auto& cell : cells) {
-      const auto bucket = buckets.find(VoxelKey{cell});
-      if (bucket == buckets.end()) {
-        continue;
-      }
-      for (const size_t index : bucket->second) {
-        const PoseRecord& record = records[index];
-        if (gone.count(record.id) > 0 || record.axis.dot(seed.axis) <= cos_view ||
-            !seen.insert(record.id).second) {
-          continue;
-        }
-        members.push_back(record.id);
-      }
-    }
-    if (members.size() <= max_per_cell) {
-      continue;
-    }
-
-    std::vector<std::pair<double, image_t>> removable;
-    size_t num_alive = 0;
-    for (const image_t id : members) {
-      if (gone.count(id) > 0 || !reconstruction_->ExistsImage(id) ||
-          !reconstruction_->Image(id).HasPose()) {
-        continue;
-      }
-      ++num_alive;
-      if (!IsRemovable(id,
-                       kInvalidImageId,
-                       recent_ids,
-                       protected_ids,
-                       allow_prior_session)) {
-        continue;
-      }
-      removable.emplace_back(ClosestObserverRatio(id), id);
-    }
-    if (num_alive <= max_per_cell) {
-      continue;
-    }
-    std::sort(removable.begin(), removable.end());
-    size_t excess = num_alive - max_per_cell;
-    for (const auto& [score, id] : removable) {
-      if (excess == 0) {
-        break;
-      }
-      if (RemoveKeyframe(id, "capacity_loop", score)) {
-        gone.insert(id);
-        evicted.push_back(id);
-        --excess;
-        LOG(INFO) << "OnlineMapper: evicted keyframe " << id
-                  << " after loop correction, score=" << score
-                  << " members=" << num_alive;
-      }
-    }
-  }
-  return evicted;
-}
-
-std::vector<image_t> OnlineMapper::RemoveStaleKeyframes(
-    const image_t current_id,
-    const std::unordered_set<image_t>& protected_ids) {
-  std::vector<image_t> removed;
-  if (!options_.point_stats_enabled || !initialized_ || !obs_manager_ ||
-      stale_lost_points_.empty()) {
-    return removed;
-  }
-  const FlatHashSet<image_t> recent_ids = RecentRegisteredIds();
-  const bool allow_prior_session = PriorSessionEditable();
-  const size_t min_points =
-      static_cast<size_t>(std::max(options_.stale_frame_min_points, 0));
-  std::vector<std::pair<double, image_t>> candidates;
-  for (auto it = stale_lost_points_.begin(); it != stale_lost_points_.end();) {
-    const image_t id = it->first;
+    const std::vector<image_t>& image_ids) {
+  std::vector<image_t> replaced;
+  // Newest first: the first frame processed defines its cell and removes the
+  // older keyframes of it, which the later iterations then find pose-less.
+  std::vector<image_t> ids = image_ids;
+  std::sort(ids.begin(), ids.end(), std::greater<image_t>());
+  ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+  for (const image_t id : ids) {
     if (!reconstruction_->ExistsImage(id) ||
         !reconstruction_->Image(id).HasPose()) {
-      it = stale_lost_points_.erase(it);
       continue;
     }
-    const size_t remaining = reconstruction_->Image(id).NumPoints3D();
-    const double lost_ratio =
-        static_cast<double>(it->second) /
-        static_cast<double>(it->second + remaining);
-    // A weak frame that lost only a point or two is not judged by its size.
-    const bool emptied = remaining < min_points && it->second >= remaining;
-    if ((emptied || lost_ratio >= options_.stale_frame_max_lost_ratio) &&
-        IsRemovable(
-            id, current_id, recent_ids, protected_ids, allow_prior_session)) {
-      candidates.emplace_back(lost_ratio, id);
-    }
-    ++it;
+    const std::vector<image_t> removed = EnforceSpatialCapacity(id);
+    replaced.insert(replaced.end(), removed.begin(), removed.end());
   }
-  std::sort(candidates.begin(), candidates.end(), std::greater<>());
-  for (const auto& [lost_ratio, id] : candidates) {
-    const size_t lost = stale_lost_points_[id];
-    if (RemoveKeyframe(id, "stale", lost_ratio)) {
-      LOG(INFO) << "OnlineMapper: removed stale keyframe " << id
-                << " lost=" << lost << " lost_ratio=" << lost_ratio;
-      stale_lost_points_.erase(id);
-      removed.push_back(id);
-    }
-  }
-  return removed;
-}
-
-double OnlineMapper::ClosestObserverRatio(const image_t image_id) const {
-  const Image& image = reconstruction_->Image(image_id);
-  if (!image.HasPose()) {
-    return 0.0;
-  }
-  const Eigen::Vector3d center = image.ProjectionCenter();
-  std::unordered_map<image_t, Eigen::Vector3d> centers;
-  const auto center_of = [&](const image_t id) -> const Eigen::Vector3d& {
-    auto it = centers.find(id);
-    if (it == centers.end()) {
-      it = centers.emplace(id, reconstruction_->Image(id).ProjectionCenter())
-               .first;
-    }
-    return it->second;
-  };
-
-  size_t num_points = 0;
-  size_t num_closest = 0;
-  FlatHashSet<image_t> counted;
-  for (const Point2D& point2D : image.Points2D()) {
-    if (!point2D.HasPoint3D() ||
-        !reconstruction_->ExistsPoint3D(point2D.point3D_id)) {
-      continue;
-    }
-    ++num_points;
-    // Points the scene no longer shows keep the denominator but earn nothing.
-    if (PointLooksGone(point2D.point3D_id)) {
-      continue;
-    }
-    const Point3D& point3D = reconstruction_->Point3D(point2D.point3D_id);
-    const double own_dist_sq = (point3D.xyz - center).squaredNorm();
-    counted.clear();
-    bool closest = true;
-    for (const TrackElement& el : point3D.track.Elements()) {
-      if (el.image_id == image_id || !counted.insert(el.image_id).second) {
-        continue;
-      }
-      const Image& other = reconstruction_->Image(el.image_id);
-      if (!other.HasPose()) {
-        continue;
-      }
-      if ((point3D.xyz - center_of(el.image_id)).squaredNorm() < own_dist_sq) {
-        closest = false;
-        break;
-      }
-    }
-    if (closest) {
-      ++num_closest;
-    }
-  }
-  return num_points > 0
-             ? static_cast<double>(num_closest) / static_cast<double>(num_points)
-             : 0.0;
-}
-
-double OnlineMapper::PointQuality(const point3D_t point3D_id) const {
-  if (!options_.point_stats_enabled) {
-    return 1.0;
-  }
-  const auto it = point_stats_.find(point3D_id);
-  if (it == point_stats_.end()) {
-    return 0.5;
-  }
-  return (it->second.num_found + 1.0) / (it->second.num_visible + 2.0);
-}
-
-bool OnlineMapper::PointLooksGone(const point3D_t point3D_id) const {
-  if (!options_.point_stats_enabled) {
-    return false;
-  }
-  const auto it = point_stats_.find(point3D_id);
-  return it != point_stats_.end() && it->second.consecutive_misses >= 2;
+  return replaced;
 }
 
 void OnlineMapper::EnsureDescriptors(const FlatHashSet<image_t>& image_ids) {
@@ -2429,258 +1811,6 @@ void OnlineMapper::EnsureDescriptors(const FlatHashSet<image_t>& image_ids) {
         CacheKeypointScales(id, *keypoints);
       }
     }
-  }
-}
-
-void OnlineMapper::UpdatePointStats(const image_t image_id) {
-  const Image& image = reconstruction_->Image(image_id);
-  if (!image.HasPose()) {
-    return;
-  }
-
-  FlatHashSet<point2D_t> skip_points2D;
-  FlatHashSet<point3D_t> observed;
-  FlatHashSet<image_t> covis_ids;
-  for (point2D_t idx = 0; idx < image.NumPoints2D(); ++idx) {
-    const Point2D& point2D = image.Point2D(idx);
-    if (!point2D.HasPoint3D()) {
-      continue;
-    }
-    skip_points2D.insert(idx);
-    observed.insert(point2D.point3D_id);
-    for (const TrackElement& el :
-         reconstruction_->Point3D(point2D.point3D_id).track.Elements()) {
-      if (el.image_id != image_id) {
-        covis_ids.insert(el.image_id);
-      }
-    }
-  }
-  const Eigen::Vector3d center = image.ProjectionCenter();
-  // Where the scene changed the current frame shares few points with the old
-  // keyframes, so their points are reached by position, not covisibility.
-  if (options_.stale_spatial_num_images > 0 &&
-      options_.stale_spatial_max_distance_m > 0.0) {
-    const Eigen::Vector3d axis =
-        image.CamFromWorld().rotation().inverse() * Eigen::Vector3d::UnitZ();
-    const double max_dist_sq = options_.stale_spatial_max_distance_m *
-                               options_.stale_spatial_max_distance_m;
-    const double min_cos =
-        std::cos(DegToRad(options_.stale_spatial_max_angle_deg));
-    std::vector<std::pair<double, image_t>> nearby;
-    for (const image_t id : reconstruction_->RegImageIds()) {
-      if (id == image_id || covis_ids.count(id) > 0) {
-        continue;
-      }
-      const Image& other = reconstruction_->Image(id);
-      if (!other.HasPose()) {
-        continue;
-      }
-      const double dist_sq = (other.ProjectionCenter() - center).squaredNorm();
-      if (dist_sq > max_dist_sq ||
-          (other.CamFromWorld().rotation().inverse() * Eigen::Vector3d::UnitZ())
-                  .dot(axis) < min_cos) {
-        continue;
-      }
-      nearby.emplace_back(dist_sq, id);
-    }
-    std::sort(nearby.begin(), nearby.end());
-    const size_t num = std::min(
-        nearby.size(), static_cast<size_t>(options_.stale_spatial_num_images));
-    for (size_t i = 0; i < num; ++i) {
-      covis_ids.insert(nearby[i].second);
-    }
-  }
-  EnsureDescriptors(covis_ids);
-
-  FlatHashSet<point3D_t> candidates;
-  for (const image_t id : covis_ids) {
-    for (const Point2D& point2D : reconstruction_->Image(id).Points2D()) {
-      if (point2D.HasPoint3D() && observed.count(point2D.point3D_id) == 0) {
-        candidates.insert(point2D.point3D_id);
-      }
-    }
-  }
-  std::vector<point3D_t> visible;
-  std::vector<point3D_t> bare;
-  const std::vector<ProjectionMatch> matches =
-      SearchPointsByProjection(image_id,
-                               image.CamFromWorld(),
-                               options_.local_map_refine_radius_px,
-                               skip_points2D,
-                               candidates,
-                               &visible,
-                               &bare);
-  FlatHashSet<point3D_t> matched;
-  for (const ProjectionMatch& match : matches) {
-    matched.insert(match.point3D_id);
-  }
-
-  for (const point3D_t id : observed) {
-    PointStat& stat = point_stats_[id];
-    stat.num_visible += 1.0f;
-    stat.num_found += 1.0f;
-    stat.last_seen_session = session_index_;
-    stat.consecutive_misses = 0;
-    stat.consecutive_unseen = 0;
-  }
-
-  const auto judged = [&](const Point3D& point3D) {
-    return !options_.stale_prior_session_only ||
-           std::none_of(point3D.track.Elements().begin(),
-                        point3D.track.Elements().end(),
-                        [&](const TrackElement& el) {
-                          return pose_priors_.count(el.image_id) > 0;
-                        });
-  };
-  const bool counts_misses =
-      !options_.stale_require_aligned || last_frame_aligned_;
-  const bool unseen_enabled =
-      counts_misses && options_.stale_max_consecutive_unseen > 0;
-  const double min_found_ratio = options_.stale_max_found_ratio;
-  const float min_visible =
-      static_cast<float>(std::max(options_.stale_min_visible, 1));
-  size_t num_checked = 0;
-  size_t num_matched = 0;
-  size_t num_bare = 0;
-  std::vector<point3D_t> stale;
-  for (const point3D_t id : visible) {
-    const Point3D& point3D = reconstruction_->Point3D(id);
-    const bool found = matched.count(id) > 0;
-    if (!found && !counts_misses) {
-      continue;
-    }
-    ++num_checked;
-    PointStat& stat = point_stats_[id];
-    stat.num_visible += 1.0f;
-    if (found) {
-      ++num_matched;
-      stat.num_found += 1.0f;
-      stat.last_seen_session = session_index_;
-      stat.consecutive_misses = 0;
-      stat.consecutive_unseen = 0;
-      continue;
-    }
-    ++stat.consecutive_misses;
-    ++stat.consecutive_unseen;
-    if (!judged(point3D)) {
-      continue;
-    }
-    const bool missed_in_a_row =
-        options_.stale_max_consecutive_misses > 0 &&
-        stat.consecutive_misses >= options_.stale_max_consecutive_misses;
-    const bool unseen_in_a_row =
-        unseen_enabled &&
-        stat.consecutive_unseen >= options_.stale_max_consecutive_unseen;
-    if (missed_in_a_row || unseen_in_a_row ||
-        (stat.num_visible >= min_visible &&
-         stat.num_found < min_found_ratio * stat.num_visible)) {
-      stale.push_back(id);
-    }
-  }
-  // An object taken away often leaves a textureless spot, so a projection
-  // with no keypoint nearby is weak evidence: it only feeds the longer streak.
-  if (unseen_enabled) {
-    for (const point3D_t id : bare) {
-      const Point3D& point3D = reconstruction_->Point3D(id);
-      ++num_bare;
-      PointStat& stat = point_stats_[id];
-      ++stat.consecutive_unseen;
-      if (judged(point3D) &&
-          stat.consecutive_unseen >= options_.stale_max_consecutive_unseen) {
-        stale.push_back(id);
-      }
-    }
-  }
-
-  for (const point3D_t id : stale) {
-    if (reconstruction_->ExistsPoint3D(id)) {
-      for (const TrackElement& el :
-           reconstruction_->Point3D(id).track.Elements()) {
-        ++stale_lost_points_[el.image_id];
-      }
-      obs_manager_->DeletePoint3D(id);
-    }
-    point_stats_.erase(id);
-  }
-  LOG(INFO) << "OnlineMapper: point stats image " << image_id
-            << " observed=" << observed.size() << " checked=" << num_checked
-            << " matched=" << num_matched << " bare=" << num_bare
-            << " stale_removed=" << stale.size()
-            << " aligned=" << last_frame_aligned_
-            << " points3D=" << reconstruction_->NumPoints3D();
-}
-
-std::string OnlineMapper::PointStatsPath() const {
-  return (std::filesystem::path(sparse_path_) / "point_stats.bin").string();
-}
-
-namespace {
-constexpr uint32_t kPointStatsMagic = 0x50535431;  // "PST1"
-}  // namespace
-
-void OnlineMapper::WritePointStats() const {
-  if (!options_.point_stats_enabled || sparse_path_.empty()) {
-    return;
-  }
-  try {
-    std::ofstream file(PointStatsPath(), std::ios::binary | std::ios::trunc);
-    if (!file.is_open()) {
-      return;
-    }
-    uint64_t count = 0;
-    for (const auto& [id, stat] : point_stats_) {
-      (void)stat;
-      count += reconstruction_->ExistsPoint3D(id) ? 1 : 0;
-    }
-    WriteBinaryLittleEndian<uint32_t>(&file, kPointStatsMagic);
-    WriteBinaryLittleEndian<uint32_t>(&file, session_index_);
-    WriteBinaryLittleEndian<uint64_t>(&file, count);
-    for (const auto& [id, stat] : point_stats_) {
-      if (!reconstruction_->ExistsPoint3D(id)) {
-        continue;
-      }
-      WriteBinaryLittleEndian<uint64_t>(&file, id);
-      WriteBinaryLittleEndian<float>(&file, stat.num_visible);
-      WriteBinaryLittleEndian<float>(&file, stat.num_found);
-      WriteBinaryLittleEndian<uint32_t>(&file, stat.last_seen_session);
-    }
-  } catch (const std::exception& e) {
-    LOG(WARNING) << "OnlineMapper: failed to write point stats: " << e.what();
-  }
-}
-
-void OnlineMapper::ReadPointStats() {
-  point_stats_.clear();
-  if (!options_.point_stats_enabled ||
-      !std::filesystem::exists(PointStatsPath())) {
-    return;
-  }
-  try {
-    std::ifstream file(PointStatsPath(), std::ios::binary);
-    if (ReadBinaryLittleEndian<uint32_t>(&file) != kPointStatsMagic) {
-      LOG(WARNING) << "OnlineMapper: ignoring point stats with unknown format";
-      return;
-    }
-    const uint32_t stored_session = ReadBinaryLittleEndian<uint32_t>(&file);
-    const uint64_t count = ReadBinaryLittleEndian<uint64_t>(&file);
-    const float decay = static_cast<float>(
-        std::clamp(options_.stale_session_decay, 0.0, 1.0));
-    for (uint64_t i = 0; i < count && file.good(); ++i) {
-      const point3D_t id = ReadBinaryLittleEndian<uint64_t>(&file);
-      PointStat stat;
-      stat.num_visible = ReadBinaryLittleEndian<float>(&file) * decay;
-      stat.num_found = ReadBinaryLittleEndian<float>(&file) * decay;
-      stat.last_seen_session = ReadBinaryLittleEndian<uint32_t>(&file);
-      if (reconstruction_->ExistsPoint3D(id)) {
-        point_stats_.emplace(id, stat);
-      }
-    }
-    session_index_ = std::max(session_index_, stored_session + 1);
-    LOG(INFO) << "OnlineMapper: loaded point stats for " << point_stats_.size()
-              << " point(s), session " << session_index_;
-  } catch (const std::exception& e) {
-    point_stats_.clear();
-    LOG(WARNING) << "OnlineMapper: failed to read point stats: " << e.what();
   }
 }
 
@@ -2808,7 +1938,6 @@ void OnlineMapper::WriteSparse() const {
     const std::filesystem::path out_dir(sparse_path_);
     std::filesystem::create_directories(out_dir);
     reconstruction_->Write(out_dir);
-    WritePointStats();
     WriteVioPriors();
     sparse_writes_since_flush_ = 0;
     LOG(INFO) << "OnlineMapper: wrote sparse to " << out_dir.string()
@@ -2833,8 +1962,6 @@ void OnlineMapper::MaybeWriteSparse() {
 
 bool OnlineMapper::MappingCurrentImage(const image_t image_id,
                                        const std::optional<Rigid3d>& vio_prior) {
-  last_frame_skipped_ = false;
-  last_frame_aligned_ = false;
   if (!SyncReconstruction()) {
     return false;
   }
@@ -2871,143 +1998,12 @@ bool OnlineMapper::MappingCurrentImage(const image_t image_id,
   }
 
   if (prior_reg.success) {
-    last_frame_aligned_ = true;
-    ++session_aligned_frames_;
     ExtendTracksByProjection(image_id, "register");
   }
-  // Frames about to be skipped still vote: a revisit is mostly skipped frames.
-  // VIO-fallback frames only count found points unless stale_require_aligned
-  // is off.
-  if (options_.point_stats_enabled) {
-    UpdatePointStats(image_id);
-  }
-  if (ShouldSkipKeyframe(image_id, prior_reg.success)) {
-    SkipFrame(image_id);
-    return true;
-  }
-  consecutive_skips_ = 0;
-  ++session_mapped_frames_;
   TriangulateImage(image_id);
   MergeAndFilterPoints(image_id);
   AdjustLocalBundle(image_id);
   MaybeWriteSparse();
   return true;
 }
-
-bool OnlineMapper::ShouldSkipKeyframe(const image_t image_id,
-                                      const bool pose_from_pnp) const {
-  if (!options_.insert_check_enabled ||
-      consecutive_skips_ >= std::max(options_.insert_max_consecutive_skips, 0)) {
-    return false;
-  }
-  const Image& image = reconstruction_->Image(image_id);
-  const size_t num_tracked = image.NumPoints3D();
-  if (num_tracked <
-      static_cast<size_t>(std::max(options_.insert_min_tracked, 1))) {
-    return false;
-  }
-
-  // A VIO-prior pose can leave features unassociated without any new structure,
-  // so those two keep rules apply only to a PnP pose.
-  const size_t num_features = image.NumPoints2D();
-  if (pose_from_pnp && num_features > 0 &&
-      options_.insert_min_unmatched_ratio > 0.0) {
-    const size_t num_unmatched =
-        num_features > num_tracked ? num_features - num_tracked : 0;
-    const double unmatched_ratio = static_cast<double>(num_unmatched) /
-                                   static_cast<double>(num_features);
-    if (unmatched_ratio >= options_.insert_min_unmatched_ratio) {
-      LOG(INFO) << "OnlineMapper: insert check keep image " << image_id
-                << " unmatched_ratio=" << unmatched_ratio
-                << " tracked=" << num_tracked << "/" << num_features;
-      return false;
-    }
-  }
-  if (pose_from_pnp && options_.insert_min_short_track_ratio > 0.0) {
-    size_t num_short = 0;
-    for (const Point2D& point2D : image.Points2D()) {
-      if (!point2D.HasPoint3D() ||
-          !reconstruction_->ExistsPoint3D(point2D.point3D_id)) {
-        continue;
-      }
-      if (reconstruction_->Point3D(point2D.point3D_id).track.Length() <= 2) {
-        ++num_short;
-      }
-    }
-    const double short_ratio = static_cast<double>(num_short) /
-                               static_cast<double>(num_tracked);
-    if (short_ratio >= options_.insert_min_short_track_ratio) {
-      LOG(INFO) << "OnlineMapper: insert check keep image " << image_id
-                << " short_track_ratio=" << short_ratio
-                << " short=" << num_short << " tracked=" << num_tracked;
-      return false;
-    }
-  }
-
-  FlatHashMap<image_t, size_t> shared_points;
-  for (const Point2D& point2D : image.Points2D()) {
-    if (!point2D.HasPoint3D()) {
-      continue;
-    }
-    for (const TrackElement& el :
-         reconstruction_->Point3D(point2D.point3D_id).track.Elements()) {
-      if (el.image_id != image_id) {
-        ++shared_points[el.image_id];
-      }
-    }
-  }
-  // Reference keyframe: the nearby keyframe sharing the most points.
-  const Eigen::Vector3d center = image.ProjectionCenter();
-  const Eigen::Quaterniond rotation = image.CamFromWorld().rotation();
-  const double max_angle = DegToRad(options_.insert_max_kf_angle_deg);
-  image_t ref_id = kInvalidImageId;
-  size_t ref_shared = 0;
-  for (const auto& [other_id, count] : shared_points) {
-    if (2 * count < num_tracked || count <= ref_shared) {
-      continue;
-    }
-    const Image& other = reconstruction_->Image(other_id);
-    if (!other.HasPose() ||
-        (other.ProjectionCenter() - center).norm() >
-            options_.insert_max_kf_distance_m ||
-        Eigen::AngleAxisd(other.CamFromWorld().rotation() * rotation.inverse())
-                .angle() > max_angle) {
-      continue;
-    }
-    ref_id = other_id;
-    ref_shared = count;
-  }
-  if (ref_id == kInvalidImageId) {
-    return false;
-  }
-  const size_t ref_tracked = reconstruction_->Image(ref_id).NumPoints3D();
-  if (static_cast<double>(num_tracked) <
-      options_.insert_ref_tracked_ratio * static_cast<double>(ref_tracked)) {
-    return false;
-  }
-
-  size_t num_points = 0;
-  const double ratio = RedundantPointRatio(image_id, &num_points);
-  LOG(INFO) << "OnlineMapper: insert check image " << image_id
-            << " tracked=" << num_tracked << " ref_kf=" << ref_id
-            << " ref_tracked=" << ref_tracked << " redundant_ratio=" << ratio;
-  return ratio >= options_.insert_redundant_ratio;
-}
-
-void OnlineMapper::SkipFrame(const image_t image_id) {
-  const Image& image = reconstruction_->Image(image_id);
-  const auto prior_it = pose_priors_.find(image_id);
-  if (prior_it != pose_priors_.end()) {
-    tracking_anchor_ =
-        TrackingAnchor{image_id, prior_it->second, image.CamFromWorld()};
-  }
-  const size_t num_tracked = image.NumPoints3D();
-  RemoveKeyframe(image_id, "skipped", static_cast<double>(num_tracked));
-  ++consecutive_skips_;
-  last_frame_skipped_ = true;
-  LOG(INFO) << "OnlineMapper: dropped non-keyframe " << image_id
-            << " tracked=" << num_tracked
-            << " consecutive=" << consecutive_skips_;
-}
-
 }  // namespace colmap

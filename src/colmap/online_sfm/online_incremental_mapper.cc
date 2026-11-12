@@ -551,7 +551,17 @@ bool OnlineIncrementalMapper::Process(
         image_abs_path,
         cam_from_world_prior,
         extracted.bitmap.IsEmpty() ? nullptr : &extracted.bitmap);
-    WriteMappingResult(image_id, {}, {}, mapping_result);
+    // A successful relocalization registers the frame and runs local BA, so
+    // its cell is settled from the refined pose.
+    std::vector<image_t> removed_ids;
+    if (handled && mode_ == SessionMode::kMapping) {
+      for (const image_t replaced_id :
+           mapper_->EnforceSpatialCapacity(image_id)) {
+        matcher_->ForgetImage(replaced_id);
+        removed_ids.push_back(replaced_id);
+      }
+    }
+    WriteMappingResult(image_id, removed_ids, {}, mapping_result);
     return handled;
   }
 
@@ -559,22 +569,6 @@ bool OnlineIncrementalMapper::Process(
     WriteMappingResult(image_id, {}, {}, mapping_result);
     return false;
   }
-  if (mapper_->LastFrameSkipped()) {
-    std::unordered_set<image_t> protected_ids;
-    if (loop_closer_) {
-      loop_closer_->CollectProtectedImageIds(&protected_ids);
-    }
-    std::vector<image_t> removed_ids = {image_id};
-    matcher_->ForgetImage(image_id);
-    for (const image_t stale_id :
-         mapper_->RemoveStaleKeyframes(image_id, protected_ids)) {
-      matcher_->ForgetImage(stale_id);
-      removed_ids.push_back(stale_id);
-    }
-    WriteMappingResult(image_id, removed_ids, {}, mapping_result);
-    return true;
-  }
-
   std::vector<image_t> removed_ids;
   std::vector<image_t> dirty_ids;
   const OnlineLoopCorrection* correction = nullptr;
@@ -595,40 +589,21 @@ bool OnlineIncrementalMapper::Process(
     dirty_ids = correction->variable_ids;
   }
 
-  std::unordered_set<image_t> protected_ids;
-  if (loop_closer_) {
-    loop_closer_->CollectProtectedImageIds(&protected_ids);
-  }
-  const std::vector<image_t> culled_ids =
+  // Grid replacement comes last, so the cell is decided from the pose after
+  // local BA, and after loop BA when a loop moved it. The newest keyframe of
+  // a cell replaces the older ones. Replaced frames are reported as removed
+  // but not redundant: the cell now shows a newer pass, so their depth in the
+  // dense map is retired too.
+  const std::vector<image_t> replaced_ids =
       correction == nullptr
-          ? mapper_->CullRedundantKeyframes(image_id, protected_ids)
-          : mapper_->CullRedundantKeyframes(correction->variable_ids,
-                                            protected_ids);
-  for (const image_t culled_id : culled_ids) {
-    matcher_->ForgetImage(culled_id);
-    removed_ids.push_back(culled_id);
-  }
-  const std::vector<image_t> evicted_ids =
-      correction == nullptr
-          ? mapper_->EnforceSpatialCapacity(image_id, protected_ids)
-          : mapper_->EnforceSpatialCapacity(correction->variable_ids,
-                                            protected_ids);
-  for (const image_t evicted_id : evicted_ids) {
-    matcher_->ForgetImage(evicted_id);
-    removed_ids.push_back(evicted_id);
-  }
-  for (const image_t stale_id :
-       mapper_->RemoveStaleKeyframes(image_id, protected_ids)) {
-    matcher_->ForgetImage(stale_id);
-    removed_ids.push_back(stale_id);
+          ? mapper_->EnforceSpatialCapacity(image_id)
+          : mapper_->EnforceSpatialCapacity(correction->variable_ids);
+  for (const image_t replaced_id : replaced_ids) {
+    matcher_->ForgetImage(replaced_id);
+    removed_ids.push_back(replaced_id);
   }
 
   WriteMappingResult(image_id, removed_ids, dirty_ids, mapping_result);
-  if (mapping_result != nullptr) {
-    mapping_result->redundant_ids = culled_ids;
-    mapping_result->redundant_ids.insert(mapping_result->redundant_ids.end(),
-                                         evicted_ids.begin(), evicted_ids.end());
-  }
   return true;
 }
 

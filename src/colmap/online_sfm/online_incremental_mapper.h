@@ -57,8 +57,9 @@ struct MappingFrameResult {
   bool registered = false;
   MappingPose cam_from_world;
   std::vector<image_t> removed_ids;
-  // Subset of removed_ids dropped because other keyframes already cover the
-  // same view (redundancy culling, spatial capacity), not because the scene changed.
+  // Subset of removed_ids whose depth stays valid. Grid replacement leaves
+  // this empty: a replaced keyframe's cell now shows a newer pass, so its
+  // depth is retired with it.
   std::vector<image_t> redundant_ids;
   // Keyframes whose pose changed in this call (loop correction), with the pose
   // after the correction.
@@ -84,6 +85,7 @@ inline MappingPose PoseFromRigid3d(const Rigid3d& cam_from_world) {
 //   extract -> WriteKeypoints / WriteDescriptors
 //   match current vs temporal overlap + spatial neighbors
 //   MappingCurrentImage: VIO init or P3P (+ map-frame VIO fallback) -> triangulate -> local BA
+//   then spatial grid: the newest keyframe of a cell replaces the older ones
 //   LBA: first-level covisible KFs (shared 3D tracks) are variable; other KFs
 //   that observe the same local points are constant
 //   write sparse
