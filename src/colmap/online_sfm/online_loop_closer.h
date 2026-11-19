@@ -121,6 +121,8 @@ struct OnlineLoopCloserOptions {
   // ignores 3D point error.
   double pose_graph_loop_min_rot_sigma_deg = 0.2;
   double pose_graph_loop_min_trans_sigma_m = 0.02;
+  // Ceres threads for the pose-graph solve. <=0 uses all cores.
+  int pose_graph_num_threads = 2;
   // Trajectory prior check (ROVER, arXiv 2508.13488): align the camera
   // centers of the frames between loop and current frame before / after the
   // pose graph (yaw + translation, or SE3 in 6-DoF mode) and reject the loop

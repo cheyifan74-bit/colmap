@@ -100,6 +100,8 @@ struct OnlineMapperOptions {
   // Loop BA refines the whole pose-graph-corrected chain, so it needs more
   // iterations than the per-keyframe local BA (fixed at 10).
   int ba_loop_max_num_iterations = 50;
+  // Ceres threads for local / loop BA. <=0 uses all cores.
+  int ba_num_threads = 2;
   // Loop BA also ties every chain frame to its pose-graph pose, so directions
   // the observations leave unconstrained stay at the graph solution instead
   // of drifting. <= 0 disables.

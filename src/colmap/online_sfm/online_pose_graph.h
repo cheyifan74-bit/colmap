@@ -27,6 +27,8 @@ struct PoseGraphEdge {
 
 struct PoseGraphOptions {
   int max_num_iterations = 50;
+  // Ceres threads. <=0 uses all cores.
+  int num_threads = 2;
   // Optimize camera center + yaw about world +z per node; roll / pitch stay at
   // their input values. Requires a gravity-aligned (VIO) world frame.
   bool four_dof = false;

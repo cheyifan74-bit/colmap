@@ -64,7 +64,8 @@ namespace colmap {
 namespace {
 
 BundleAdjustmentOptions MakeLocalBaOptions(const int min_track_length,
-                                           const int max_num_iterations = 10) {
+                                           const int max_num_iterations = 10,
+                                           const int num_threads = -1) {
   BundleAdjustmentOptions options;
   options.refine_focal_length = false;
   options.refine_principal_point = false;
@@ -77,6 +78,7 @@ BundleAdjustmentOptions MakeLocalBaOptions(const int min_track_length,
         CeresBundleAdjustmentOptions::LossFunctionType::SOFT_L1;
     options.ceres->loss_function_scale = 1.0;
     options.ceres->solver_options.max_num_iterations = max_num_iterations;
+    options.ceres->solver_options.num_threads = num_threads;
     options.ceres->solver_options.logging_type = ceres::LoggingType::SILENT;
   }
   return options;
@@ -1422,7 +1424,8 @@ void OnlineMapper::AdjustLocalBundle(const image_t image_id) {
   const auto prior_loss =
       std::make_unique<ceres::HuberLoss>(std::sqrt(kChiSquare95ThreeDof * 2.0));
   auto bundle_adjuster = CreateDefaultCeresBundleAdjuster(
-      MakeLocalBaOptions(0), ba_config, *reconstruction_);
+      MakeLocalBaOptions(0, /*max_num_iterations=*/10, options_.ba_num_threads),
+      ba_config, *reconstruction_);
   const size_t num_vio_priors = AddVioPriorsToLocalBundle(
       local_ids, *reconstruction_, bundle_adjuster->Problem().get(),
       prior_loss.get());
@@ -1570,7 +1573,8 @@ void OnlineMapper::AdjustLoopBundle(const std::vector<image_t>& variable_ids,
   const auto prior_loss =
       std::make_unique<ceres::HuberLoss>(std::sqrt(kChiSquare95ThreeDof * 2.0));
   auto bundle_adjuster = CreateDefaultCeresBundleAdjuster(
-      MakeLocalBaOptions(0, options_.ba_loop_max_num_iterations),
+      MakeLocalBaOptions(0, options_.ba_loop_max_num_iterations,
+                         options_.ba_num_threads),
       ba_config,
       *reconstruction_);
   // Weak-texture frames have few or no observations; the VIO priors keep them

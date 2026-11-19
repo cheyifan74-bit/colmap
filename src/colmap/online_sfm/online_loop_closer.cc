@@ -2330,6 +2330,7 @@ void OnlineLoopCloser::FuseAfterLoopBA(Reconstruction& reconstruction,
 PoseGraphOptions OnlineLoopCloser::MakePoseGraphOptions() const {
   PoseGraphOptions graph_options;
   graph_options.four_dof = options_.pose_graph_4dof;
+  graph_options.num_threads = options_.pose_graph_num_threads;
   return graph_options;
 }
 

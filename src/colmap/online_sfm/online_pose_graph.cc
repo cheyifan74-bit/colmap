@@ -1,6 +1,7 @@
 #include "colmap/online_sfm/online_pose_graph.h"
 
 #include "colmap/util/logging.h"
+#include "colmap/util/threading.h"
 
 #include <cmath>
 #include <memory>
@@ -237,6 +238,7 @@ PoseGraphSummary OptimizePoseGraph(
   ceres::Solver::Options solver_options;
   solver_options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
   solver_options.max_num_iterations = options.max_num_iterations;
+  solver_options.num_threads = GetEffectiveNumThreads(options.num_threads);
   solver_options.logging_type = ceres::LoggingType::SILENT;
   solver_options.minimizer_progress_to_stdout = false;
   ceres::Solver::Summary ceres_summary;
