@@ -574,6 +574,46 @@ size_t ObservationManager::FilterPoints3DWithSmallTriangulationAngle(
   return num_filtered_observations;
 }
 
+size_t ObservationManager::FilterTwoViewPointsWithSmallTriangulationAngle(
+    const double min_tri_angle, const FlatHashSet<point3D_t>& point3D_ids) {
+  if (min_tri_angle <= 0.0) {
+    return 0;
+  }
+  const double min_tri_angle_rad = DegToRad(min_tri_angle);
+  size_t num_filtered_observations = 0;
+  FlatHashMap<image_t, Eigen::Vector3d> proj_centers;
+
+  for (const auto point3D_id : point3D_ids) {
+    if (!reconstruction_.ExistsPoint3D(point3D_id)) {
+      continue;
+    }
+    const struct Point3D& point3D = reconstruction_.Point3D(point3D_id);
+    if (point3D.track.Length() != 2) {
+      continue;
+    }
+
+    const image_t image_id1 = point3D.track.Element(0).image_id;
+    const image_t image_id2 = point3D.track.Element(1).image_id;
+    auto center_of = [&](const image_t image_id) {
+      const auto it = proj_centers.find(image_id);
+      if (it != proj_centers.end()) {
+        return it->second;
+      }
+      const Eigen::Vector3d center =
+          reconstruction_.Image(image_id).ProjectionCenter();
+      return proj_centers.emplace(image_id, center).first->second;
+    };
+    const double tri_angle = CalculateTriangulationAngle(
+        center_of(image_id1), center_of(image_id2), point3D.xyz);
+    if (tri_angle < min_tri_angle_rad) {
+      num_filtered_observations += point3D.track.Length();
+      DeletePoint3D(point3D_id);
+    }
+  }
+
+  return num_filtered_observations;
+}
+
 size_t ObservationManager::FilterPoints3DWithLargeReprojectionError(
     const double max_error,
     const FlatHashSet<point3D_t>& point3D_ids,

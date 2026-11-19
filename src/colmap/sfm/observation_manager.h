@@ -145,6 +145,13 @@ class ObservationManager {
   size_t FilterPoints3DWithSmallTriangulationAngle(
       double min_tri_angle, const FlatHashSet<point3D_t>& point3D_ids);
 
+  // Points whose track fell back to two observations after the reprojection
+  // filter. Creation-time ignore_two_view_tracks does not see them again.
+  // Delete those whose only triangulation angle is below min_tri_angle.
+  // <= 0 disables. Returns the number of removed observations.
+  size_t FilterTwoViewPointsWithSmallTriangulationAngle(
+      double min_tri_angle, const FlatHashSet<point3D_t>& point3D_ids);
+
   // Filter observations with large reprojection error.
   //
   // @param max_error       Maximum error threshold. For PIXEL and NORMALIZED,
